@@ -1,0 +1,579 @@
+#!/usr/bin/env node
+/**
+ * whoop — fetch data from the WHOOP API
+ *
+ * Usage:
+ *   whoop today                          # recovery, sleep, strain, workouts for current cycle
+ *   whoop date 2025-01-15                # all data for a specific date
+ *   whoop range 2025-01-01 2025-01-31    # all data across a date range
+ *   whoop recovery [--days N]            # recent recovery scores (default: 7)
+ *   whoop sleep [--days N]               # recent sleep sessions
+ *   whoop strain [--days N]              # recent strain/cycle data
+ *   whoop workout [--days N]             # recent workouts
+ *   whoop profile                        # user profile + body measurements
+ *
+ * Credentials read from env (or auto-loaded from .env):
+ *   WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET, WHOOP_REFRESH_TOKEN
+ *
+ * Token cache written to /workspace/group/.whoop-tokens.json (container)
+ *   or store/.whoop-tokens.json (host)
+ */
+
+'use strict';
+
+const https = require('https');
+const fs    = require('fs');
+const path  = require('path');
+
+// ── Load .env when running on host ────────────────────────────────────────────
+
+(function loadDotEnv() {
+  if (fs.existsSync('/workspace/group')) return; // inside container — env already injected
+  const candidates = [
+    path.join(__dirname, '.env'),
+    path.join(__dirname, '..', '.env'),
+    path.join(__dirname, '..', '..', '.env'),
+    path.join(__dirname, '..', '..', '..', '.env'),
+  ];
+  for (const f of candidates) {
+    if (!fs.existsSync(f)) continue;
+    for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+      const t  = line.trim();
+      if (!t || t.startsWith('#')) continue;
+      const eq = t.indexOf('=');
+      if (eq < 0) continue;
+      const key = t.slice(0, eq).trim();
+      const val = t.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+      if (!(key in process.env)) process.env[key] = val;
+    }
+    break;
+  }
+})();
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const TOKEN_URL = 'https://api.prod.whoop.com/oauth/oauth2/token';
+const REDIRECT  = 'http://localhost:9877/callback';
+const V1        = 'https://api.prod.whoop.com/developer/v1';
+const V2        = 'https://api.prod.whoop.com/developer/v2';
+
+// Token cache location: writable group dir in container, store/ on host
+const TOKEN_CACHE = fs.existsSync('/workspace/group')
+  ? '/workspace/group/.whoop-tokens.json'
+  : path.join(__dirname, '..', '..', '..', 'store', '.whoop-tokens.json');
+
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+function httpPost(url, formData) {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams(formData).toString();
+    const u    = new URL(url);
+    const opts = {
+      hostname: u.hostname,
+      path:     u.pathname + u.search,
+      method:   'POST',
+      headers: {
+        'Content-Type':   'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = https.request(opts, res => {
+      let raw = '';
+      res.on('data', c => (raw += c));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
+        catch { resolve({ status: res.statusCode, body: raw }); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function httpGet(url, token) {
+  return new Promise((resolve, reject) => {
+    const u    = new URL(url);
+    const opts = {
+      hostname: u.hostname,
+      path:     u.pathname + u.search,
+      method:   'GET',
+      headers:  { Authorization: `Bearer ${token}` },
+    };
+    const req = https.request(opts, res => {
+      let raw = '';
+      res.on('data', c => (raw += c));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
+        catch { resolve({ status: res.statusCode, body: raw }); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// ── Token management ──────────────────────────────────────────────────────────
+
+function loadCache() {
+  try { return JSON.parse(fs.readFileSync(TOKEN_CACHE, 'utf8')); }
+  catch { return null; }
+}
+
+function saveCache(tokens) {
+  try {
+    fs.mkdirSync(path.dirname(TOKEN_CACHE), { recursive: true });
+    fs.writeFileSync(TOKEN_CACHE, JSON.stringify(tokens, null, 2));
+    // On host: also write rotated refresh token back to .env
+    if (!fs.existsSync('/workspace/group')) {
+      const envFile = [
+        path.join(__dirname, '..', '..', '..', '.env'),
+        path.join(__dirname, '..', '..', '.env'),
+      ].find(f => fs.existsSync(f));
+      if (envFile) {
+        const lines = fs.readFileSync(envFile, 'utf8').split('\n');
+        const idx   = lines.findIndex(l => l.startsWith('WHOOP_REFRESH_TOKEN='));
+        const entry = `WHOOP_REFRESH_TOKEN=${tokens.refresh_token}`;
+        if (idx >= 0) lines[idx] = entry;
+        else lines.push(entry);
+        fs.writeFileSync(envFile, lines.join('\n'));
+      }
+    }
+  } catch (e) { /* non-fatal */ }
+}
+
+async function getAccessToken() {
+  const clientId     = process.env.WHOOP_CLIENT_ID;
+  const clientSecret = process.env.WHOOP_CLIENT_SECRET;
+  const envRefresh   = process.env.WHOOP_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret) {
+    die('WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET must be set.\nRun: node scripts/whoop-setup');
+  }
+
+  const cache = loadCache();
+  const now   = Date.now();
+  if (cache && cache.access_token && cache.expires_at && cache.expires_at > now + 60000) {
+    return cache.access_token;
+  }
+
+  const refreshToken = (cache && cache.refresh_token) || envRefresh;
+  if (!refreshToken) die('No WHOOP refresh token. Run: node scripts/whoop-setup');
+
+  const res = await httpPost(TOKEN_URL, {
+    grant_type:    'refresh_token',
+    client_id:     clientId,
+    client_secret: clientSecret,
+    redirect_uri:  REDIRECT,
+    refresh_token: refreshToken,
+  });
+
+  if (res.status !== 200 || !res.body.access_token) {
+    die(`Token refresh failed (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+  }
+
+  const newCache = {
+    access_token:  res.body.access_token,
+    refresh_token: res.body.refresh_token || refreshToken,
+    expires_at:    now + (res.body.expires_in || 3600) * 1000,
+  };
+  saveCache(newCache);
+  return newCache.access_token;
+}
+
+// ── API helpers ───────────────────────────────────────────────────────────────
+
+async function fetchAll(url, token) {
+  const records = [];
+  let nextToken = null;
+  const base    = new URL(url);
+  do {
+    if (nextToken) base.searchParams.set('nextToken', nextToken);
+    const res = await httpGet(base.toString(), token);
+    if (res.status !== 200) throw new Error(`API ${res.status} for ${base.pathname}: ${JSON.stringify(res.body)}`);
+    (res.body.records || []).forEach(r => records.push(r));
+    nextToken = res.body.next_token || null;
+  } while (nextToken);
+  return records;
+}
+
+async function fetchOne(url, token) {
+  const res = await httpGet(url, token);
+  if (res.status !== 200) throw new Error(`API ${res.status}: ${JSON.stringify(res.body)}`);
+  return res.body;
+}
+
+// Fetch cycles, then enrich each with nested recovery/sleep/workout
+async function fetchCyclesWithData(params, token, { withRecovery = true, withSleep = true, withWorkout = false } = {}) {
+  const q = new URL(`${V1}/cycle`);
+  if (params.start) q.searchParams.set('start', params.start);
+  if (params.end)   q.searchParams.set('end',   params.end);
+  q.searchParams.set('limit', '25');
+
+  const cycles = await fetchAll(q.toString(), token);
+
+  await Promise.all(cycles.map(async cycle => {
+    const [rec, slp, wrk] = await Promise.all([
+      withRecovery ? httpGet(`${V2}/cycle/${cycle.id}/recovery`, token).catch(() => null) : null,
+      withSleep    ? httpGet(`${V2}/cycle/${cycle.id}/sleep`,    token).catch(() => null) : null,
+      withWorkout  ? null : null,
+    ]);
+    cycle._recovery = rec && rec.status === 200 ? rec.body : null;
+    cycle._sleep    = slp && slp.status === 200 ? slp.body : null;
+  }));
+
+  return cycles;
+}
+
+// ── Date helpers ──────────────────────────────────────────────────────────────
+
+function todayParams() {
+  const now = new Date();
+  // Go back 2 days to catch the current physiological cycle (starts previous evening)
+  const start = new Date(now); start.setDate(start.getDate() - 2); start.setHours(0, 0, 0, 0);
+  const end   = new Date(now); end.setDate(end.getDate() + 1);     end.setHours(23, 59, 59, 999);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+function dateParams(dateStr) {
+  const d     = new Date(dateStr + 'T12:00:00');
+  const start = new Date(d); start.setDate(start.getDate() - 2); start.setHours(0, 0, 0, 0);
+  const end   = new Date(d); end.setDate(end.getDate() + 1);     end.setHours(23, 59, 59, 999);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+function daysAgoParams(days) {
+  const end   = new Date(); end.setHours(23, 59, 59, 999);
+  const start = new Date(); start.setDate(start.getDate() - days); start.setHours(0, 0, 0, 0);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+function rangeParams(startStr, endStr) {
+  return {
+    start: new Date(startStr + 'T00:00:00').toISOString(),
+    end:   new Date(endStr   + 'T23:59:59').toISOString(),
+  };
+}
+
+// ── Formatters ────────────────────────────────────────────────────────────────
+
+function fmtDate(iso) {
+  if (!iso) return 'N/A';
+  return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function fmtDuration(ms) {
+  if (!ms) return 'N/A';
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  return `${h}h ${m}m`;
+}
+
+function recoveryLabel(score) {
+  if (!score) return '';
+  if (score >= 67) return '🟢';
+  if (score >= 34) return '🟡';
+  return '🔴';
+}
+
+function fmtRecovery(r) {
+  if (!r) return '  No recovery data';
+  const s = r.score || {};
+  return [
+    `  Recovery:    ${s.recovery_score != null ? recoveryLabel(s.recovery_score) + ' ' + s.recovery_score + '%' : 'N/A'}`,
+    `  HRV:         ${s.hrv_rmssd_milli != null ? s.hrv_rmssd_milli.toFixed(1) + ' ms' : 'N/A'}`,
+    `  Resting HR:  ${s.resting_heart_rate != null ? s.resting_heart_rate + ' bpm' : 'N/A'}`,
+    `  SpO2:        ${s.spo2_percentage != null ? s.spo2_percentage.toFixed(1) + '%' : 'N/A'}`,
+    `  Skin temp:   ${s.skin_temp_celsius != null ? s.skin_temp_celsius.toFixed(2) + '°C' : 'N/A'}`,
+  ].join('\n');
+}
+
+function fmtSleep(s) {
+  if (!s) return '  No sleep data';
+  const sc = s.score || {};
+  const st = sc.stage_summary || {};
+  return [
+    `  Sleep score: ${sc.sleep_performance_percentage != null ? sc.sleep_performance_percentage + '%' : 'N/A'}`,
+    `  In bed:      ${fmtDuration(st.total_in_bed_time_milli)}`,
+    `  Deep:        ${fmtDuration(st.total_slow_wave_sleep_time_milli)}`,
+    `  REM:         ${fmtDuration(st.total_rem_sleep_time_milli)}`,
+    `  Light:       ${fmtDuration(st.total_light_sleep_time_milli)}`,
+    `  Efficiency:  ${sc.sleep_efficiency_percentage != null ? sc.sleep_efficiency_percentage.toFixed(1) + '%' : 'N/A'}`,
+    `  Respiratory: ${sc.respiratory_rate != null ? sc.respiratory_rate.toFixed(1) + ' rpm' : 'N/A'}`,
+    `  Disturbances:${st.disturbance_count != null ? ' ' + st.disturbance_count : ' N/A'}`,
+  ].join('\n');
+}
+
+function fmtStrain(c) {
+  const s = c.score || {};
+  return [
+    `  Strain:    ${s.strain != null ? s.strain.toFixed(1) + '/21' : 'N/A'}`,
+    `  Avg HR:    ${s.average_heart_rate != null ? s.average_heart_rate + ' bpm' : 'N/A'}`,
+    `  Max HR:    ${s.max_heart_rate != null ? s.max_heart_rate + ' bpm' : 'N/A'}`,
+    `  Energy:    ${s.kilojoule != null ? s.kilojoule.toFixed(0) + ' kJ' : 'N/A'}`,
+  ].join('\n');
+}
+
+function fmtWorkout(w) {
+  const s    = w.score || {};
+  const name = w.sport_name || `sport #${w.sport_id}`;
+  const dur  = w.start && w.end ? new Date(w.end) - new Date(w.start) : null;
+  return [
+    `  [${fmtDate(w.start)}] ${name}`,
+    `    Strain: ${s.strain != null ? s.strain.toFixed(1) : 'N/A'}/21 · Dur: ${fmtDuration(dur)}`,
+    `    Avg HR: ${s.average_heart_rate != null ? s.average_heart_rate + ' bpm' : 'N/A'} · Max HR: ${s.max_heart_rate != null ? s.max_heart_rate + ' bpm' : 'N/A'}`,
+  ].join('\n');
+}
+
+function fmtCycleBlock(c, label) {
+  const lines = [`── ${label} ─────────────────────────────`];
+  lines.push('');
+  if (c._recovery) {
+    lines.push('Recovery:');
+    lines.push(fmtRecovery(c._recovery));
+    lines.push('');
+  }
+  if (c._sleep) {
+    lines.push('Sleep:');
+    lines.push(fmtSleep(c._sleep));
+    lines.push('');
+  }
+  lines.push('Strain:');
+  lines.push(fmtStrain(c));
+  return lines.join('\n');
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+async function cmdToday() {
+  const token  = await getAccessToken();
+  const params = todayParams();
+  const cycles = await fetchCyclesWithData(params, token, { withRecovery: true, withSleep: true });
+
+  if (!cycles.length) return 'No WHOOP data found for today.';
+
+  // Most recent = current cycle
+  const current = cycles[0];
+  const lines   = [];
+
+  // Workouts for today
+  const now     = new Date();
+  const q       = new URL(`${V2}/activity/workout`);
+  q.searchParams.set('start', params.start);
+  q.searchParams.set('end',   params.end);
+  q.searchParams.set('limit', '10');
+  const workouts = await fetchAll(q.toString(), token).catch(() => []);
+
+  lines.push(`── Today (${fmtDate(now.toISOString())}) ───────────────────`);
+  lines.push('');
+
+  if (current._recovery) {
+    lines.push('Recovery:');
+    lines.push(fmtRecovery(current._recovery));
+    lines.push('');
+  } else {
+    lines.push('Recovery: not yet scored');
+    lines.push('');
+  }
+
+  if (current._sleep) {
+    lines.push('Sleep:');
+    lines.push(fmtSleep(current._sleep));
+    lines.push('');
+  }
+
+  lines.push('Strain:');
+  lines.push(fmtStrain(current));
+
+  if (workouts.length) {
+    lines.push('');
+    lines.push('Workouts:');
+    workouts.forEach(w => lines.push(fmtWorkout(w)));
+  }
+
+  return lines.join('\n');
+}
+
+async function cmdDate(dateStr) {
+  const token  = await getAccessToken();
+  const params = dateParams(dateStr);
+  const cycles = await fetchCyclesWithData(params, token, { withRecovery: true, withSleep: true });
+
+  if (!cycles.length) return `No WHOOP data found for ${dateStr}.`;
+
+  const c     = cycles[0];
+  const lines = [`── ${fmtDate(dateStr + 'T12:00:00')} ──────────────────────`];
+  lines.push('');
+
+  if (c._recovery) { lines.push('Recovery:'); lines.push(fmtRecovery(c._recovery)); lines.push(''); }
+  if (c._sleep)    { lines.push('Sleep:');    lines.push(fmtSleep(c._sleep));        lines.push(''); }
+  lines.push('Strain:'); lines.push(fmtStrain(c));
+
+  const q = new URL(`${V2}/activity/workout`);
+  q.searchParams.set('start', params.start);
+  q.searchParams.set('end',   params.end);
+  q.searchParams.set('limit', '10');
+  const workouts = await fetchAll(q.toString(), token).catch(() => []);
+  if (workouts.length) { lines.push(''); lines.push('Workouts:'); workouts.forEach(w => lines.push(fmtWorkout(w))); }
+
+  return lines.join('\n');
+}
+
+async function cmdRange(startStr, endStr) {
+  const token  = await getAccessToken();
+  const params = rangeParams(startStr, endStr);
+  const cycles = await fetchCyclesWithData(params, token, { withRecovery: true, withSleep: true });
+
+  const q = new URL(`${V2}/activity/workout`);
+  q.searchParams.set('start', params.start);
+  q.searchParams.set('end',   params.end);
+  q.searchParams.set('limit', '25');
+  const workouts = await fetchAll(q.toString(), token).catch(() => []);
+
+  const lines = [`── WHOOP ${startStr} → ${endStr} ───────────────────`];
+
+  cycles.forEach(c => {
+    const label = fmtDate(c.start);
+    lines.push('');
+    lines.push(fmtCycleBlock(c, label));
+  });
+
+  if (workouts.length) {
+    lines.push('');
+    lines.push('── Workouts ──────────────────────────────────');
+    workouts.forEach(w => lines.push(fmtWorkout(w)));
+  }
+
+  return lines.join('\n');
+}
+
+async function cmdRecovery(days) {
+  const token  = await getAccessToken();
+  const params = daysAgoParams(days);
+  const cycles = await fetchCyclesWithData(params, token, { withRecovery: true, withSleep: false });
+
+  const lines = [`── Recovery (last ${days} days) ─────────────────────`];
+  cycles.forEach(c => {
+    lines.push(`\n  ${fmtDate(c.start)}`);
+    lines.push(fmtRecovery(c._recovery));
+  });
+  if (!cycles.length) lines.push('  No data found.');
+  return lines.join('\n');
+}
+
+async function cmdSleep(days) {
+  const token  = await getAccessToken();
+  const params = daysAgoParams(days);
+  const cycles = await fetchCyclesWithData(params, token, { withRecovery: false, withSleep: true });
+
+  const lines = [`── Sleep (last ${days} days) ─────────────────────────`];
+  cycles.forEach(c => {
+    lines.push(`\n  ${fmtDate(c.start)}`);
+    lines.push(fmtSleep(c._sleep));
+  });
+  if (!cycles.length) lines.push('  No data found.');
+  return lines.join('\n');
+}
+
+async function cmdStrain(days) {
+  const token  = await getAccessToken();
+  const params = daysAgoParams(days);
+  const q      = new URL(`${V1}/cycle`);
+  q.searchParams.set('start', params.start);
+  q.searchParams.set('end',   params.end);
+  q.searchParams.set('limit', '25');
+  const cycles = await fetchAll(q.toString(), token);
+
+  const lines = [`── Strain (last ${days} days) ─────────────────────────`];
+  cycles.forEach(c => {
+    lines.push(`\n  ${fmtDate(c.start)}`);
+    lines.push(fmtStrain(c));
+  });
+  if (!cycles.length) lines.push('  No data found.');
+  return lines.join('\n');
+}
+
+async function cmdWorkout(days) {
+  const token  = await getAccessToken();
+  const params = daysAgoParams(days);
+  const q      = new URL(`${V2}/activity/workout`);
+  q.searchParams.set('start', params.start);
+  q.searchParams.set('end',   params.end);
+  q.searchParams.set('limit', '25');
+  const workouts = await fetchAll(q.toString(), token);
+
+  const lines = [`── Workouts (last ${days} days) ─────────────────────`];
+  if (!workouts.length) lines.push('  No workouts found.');
+  workouts.forEach(w => { lines.push(''); lines.push(fmtWorkout(w)); });
+  return lines.join('\n');
+}
+
+async function cmdProfile() {
+  const token = await getAccessToken();
+  const [profile, body] = await Promise.all([
+    fetchOne(`${V1}/user/profile/basic`,     token).catch(e => ({ error: e.message })),
+    fetchOne(`${V1}/user/measurement/body`,   token).catch(e => ({ error: e.message })),
+  ]);
+
+  const lines = ['── WHOOP Profile ──────────────────────────'];
+  if (profile.first_name) {
+    lines.push(`  Name:    ${profile.first_name} ${profile.last_name}`);
+    lines.push(`  Email:   ${profile.email}`);
+    lines.push(`  User ID: ${profile.user_id}`);
+  } else {
+    lines.push(`  ${JSON.stringify(profile)}`);
+  }
+  lines.push('');
+  lines.push('── Body Measurements ─────────────────────');
+  if (body.height_meter !== undefined) {
+    lines.push(`  Height:  ${body.height_meter ? (body.height_meter * 100).toFixed(0) + ' cm' : 'N/A'}`);
+    lines.push(`  Weight:  ${body.weight_kilogram ? body.weight_kilogram.toFixed(1) + ' kg' : 'N/A'}`);
+    lines.push(`  Max HR:  ${body.max_heart_rate != null ? body.max_heart_rate + ' bpm' : 'N/A'}`);
+  } else {
+    lines.push(`  ${JSON.stringify(body)}`);
+  }
+  return lines.join('\n');
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+function die(msg) { console.error('Error:', msg); process.exit(1); }
+
+function usage() {
+  console.log(`Usage:
+  whoop today
+  whoop date YYYY-MM-DD
+  whoop range YYYY-MM-DD YYYY-MM-DD
+  whoop recovery [--days N]
+  whoop sleep    [--days N]
+  whoop strain   [--days N]
+  whoop workout  [--days N]
+  whoop profile`);
+  process.exit(1);
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const cmd  = args[0];
+  if (!cmd) usage();
+
+  try {
+    let out;
+    switch (cmd) {
+      case 'today':    out = await cmdToday(); break;
+      case 'date':     if (!args[1]) die('date requires YYYY-MM-DD'); out = await cmdDate(args[1]); break;
+      case 'range':    if (!args[1] || !args[2]) die('range requires two dates'); out = await cmdRange(args[1], args[2]); break;
+      case 'recovery': { const d = args.includes('--days') ? parseInt(args[args.indexOf('--days')+1]) : 7; out = await cmdRecovery(d); break; }
+      case 'sleep':    { const d = args.includes('--days') ? parseInt(args[args.indexOf('--days')+1]) : 7; out = await cmdSleep(d);    break; }
+      case 'strain':   { const d = args.includes('--days') ? parseInt(args[args.indexOf('--days')+1]) : 7; out = await cmdStrain(d);   break; }
+      case 'workout':  { const d = args.includes('--days') ? parseInt(args[args.indexOf('--days')+1]) : 7; out = await cmdWorkout(d);  break; }
+      case 'profile':  out = await cmdProfile(); break;
+      default: usage();
+    }
+    console.log(out);
+  } catch (err) {
+    die(err.message);
+  }
+}
+
+main();

@@ -1,0 +1,208 @@
+#!/usr/bin/env node
+/**
+ * whoop-setup — authorize WHOOP API access and store credentials in .env
+ *
+ * Usage: node scripts/whoop-setup
+ *   or:  ./scripts/whoop-setup
+ *
+ * Requires WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET in .env,
+ * or prompts for them interactively.
+ *
+ * After running, .env will contain WHOOP_REFRESH_TOKEN.
+ * The script syncs .env to data/env/env automatically.
+ */
+
+import https    from 'node:https';
+import http     from 'node:http';
+import fs       from 'node:fs';
+import path     from 'node:path';
+import readline from 'node:readline';
+import { exec } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const __dirname    = path.dirname(fileURLToPath(import.meta.url));
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+const ENV_FILE     = path.join(PROJECT_ROOT, '.env');
+
+const AUTH_URL  = 'https://api.prod.whoop.com/oauth/oauth2/auth';
+const TOKEN_URL = 'https://api.prod.whoop.com/oauth/oauth2/token';
+const SCOPES    = 'offline read:recovery read:cycles read:sleep read:workout read:body_measurement read:profile';
+const PORT      = 9877;
+const REDIRECT  = `http://localhost:${PORT}/callback`;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function readEnv() {
+  const env = {};
+  if (!fs.existsSync(ENV_FILE)) return env;
+  for (const line of fs.readFileSync(ENV_FILE, 'utf8').split('\n')) {
+    const [k, ...rest] = line.split('=');
+    if (k && k.trim()) env[k.trim()] = rest.join('=').trim();
+  }
+  return env;
+}
+
+function writeEnvKey(key, value) {
+  const content = fs.existsSync(ENV_FILE) ? fs.readFileSync(ENV_FILE, 'utf8') : '';
+  const lines   = content.split('\n');
+  const idx     = lines.findIndex(l => l.startsWith(key + '='));
+  const entry   = `${key}=${value}`;
+  if (idx >= 0) lines[idx] = entry;
+  else lines.push(entry);
+  // Trim trailing blank lines then add one final newline
+  const trimmed = lines.join('\n').replace(/\n+$/, '') + '\n';
+  fs.writeFileSync(ENV_FILE, trimmed);
+}
+
+function prompt(question) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => rl.question(question, ans => { rl.close(); resolve(ans.trim()); }));
+}
+
+function openBrowser(url) {
+  const cmd = process.platform === 'darwin' ? `open "${url}"` :
+              process.platform === 'win32'  ? `start "${url}"` : `xdg-open "${url}"`;
+  exec(cmd, err => { if (err) console.log(`Could not open browser: ${err.message}`); });
+}
+
+function postTokens(params) {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams(params).toString();
+    const u    = new URL(TOKEN_URL);
+    const opts = {
+      hostname: u.hostname,
+      path:     u.pathname,
+      method:   'POST',
+      headers: {
+        'Content-Type':   'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = https.request(opts, res => {
+      let raw = '';
+      res.on('data', c => (raw += c));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
+        catch { resolve({ status: res.statusCode, body: raw }); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log('\n── WHOOP Setup ─────────────────────────────\n');
+
+  const env = readEnv();
+  let clientId     = env.WHOOP_CLIENT_ID;
+  let clientSecret = env.WHOOP_CLIENT_SECRET;
+
+  if (!clientId) {
+    console.log('Enter your WHOOP app credentials.');
+    console.log('Create an app at: https://app.whoop.com/oauth/applist\n');
+    console.log(`Set the redirect URI to: ${REDIRECT}\n`);
+    clientId = await prompt('Client ID: ');
+    if (!clientId) { console.error('Client ID is required.'); process.exit(1); }
+    writeEnvKey('WHOOP_CLIENT_ID', clientId);
+  }
+
+  if (!clientSecret) {
+    clientSecret = await prompt('Client Secret: ');
+    if (!clientSecret) { console.error('Client Secret is required.'); process.exit(1); }
+    writeEnvKey('WHOOP_CLIENT_SECRET', clientSecret);
+  }
+
+  console.log(`\nClient ID:  ${clientId}`);
+  console.log(`Redirect:   ${REDIRECT}`);
+  console.log('\nStarting local callback server...');
+
+  // Build authorization URL
+  const authParams = new URLSearchParams({
+    response_type: 'code',
+    client_id:     clientId,
+    redirect_uri:  REDIRECT,
+    scope:         SCOPES,
+    state:         Math.random().toString(36).slice(2),
+  });
+  const authUrl = `${AUTH_URL}?${authParams}`;
+
+  // Start local HTTP server to catch the redirect
+  const code = await new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url, `http://localhost:${PORT}`);
+      if (url.pathname !== '/callback') { res.end('Not found'); return; }
+
+      const code  = url.searchParams.get('code');
+      const error = url.searchParams.get('error');
+
+      if (error) {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<h2>Authorization denied.</h2><p>You can close this tab.</p>');
+        server.close();
+        reject(new Error(`Authorization denied: ${error}`));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<h2>✓ Authorized!</h2><p>You can close this tab and return to your terminal.</p>');
+      server.close();
+      resolve(code);
+    });
+
+    server.listen(PORT, () => {
+      console.log(`\nOpening browser for WHOOP authorization...`);
+      console.log(`If the browser doesn't open, visit:\n${authUrl}\n`);
+      openBrowser(authUrl);
+    });
+
+    server.on('error', err => {
+      if (err.code === 'EADDRINUSE') {
+        reject(new Error(`Port ${PORT} is in use. Close that process and retry.`));
+      } else {
+        reject(err);
+      }
+    });
+
+    setTimeout(() => { server.close(); reject(new Error('Authorization timed out after 5 minutes.')); }, 300000);
+  });
+
+  console.log('Authorization code received. Exchanging for tokens...');
+
+  const res = await postTokens({
+    grant_type:    'authorization_code',
+    code,
+    client_id:     clientId,
+    client_secret: clientSecret,
+    redirect_uri:  REDIRECT,
+  });
+
+  if (res.status !== 200 || !res.body.refresh_token) {
+    console.error(`Token exchange failed (HTTP ${res.status}):`);
+    console.error(JSON.stringify(res.body, null, 2));
+    process.exit(1);
+  }
+
+  writeEnvKey('WHOOP_REFRESH_TOKEN', res.body.refresh_token);
+
+  console.log('\n✓ WHOOP credentials saved to .env');
+  console.log('  WHOOP_CLIENT_ID      ✓');
+  console.log('  WHOOP_CLIENT_SECRET  ✓');
+  console.log('  WHOOP_REFRESH_TOKEN  ✓');
+  console.log('\nSyncing to container environment...');
+
+  const dataEnvDir = path.join(PROJECT_ROOT, 'data', 'env');
+  fs.mkdirSync(dataEnvDir, { recursive: true });
+  fs.copyFileSync(ENV_FILE, path.join(dataEnvDir, 'env'));
+
+  console.log('✓ Synced to data/env/env');
+  console.log('\nSetup complete. You can now ask Pip about your WHOOP data.\n');
+}
+
+main().catch(err => {
+  console.error('\nSetup failed:', err.message);
+  process.exit(1);
+});
