@@ -1,0 +1,466 @@
+#!/usr/bin/env node
+/**
+ * strava — fetch activities from the Strava API
+ *
+ * Usage:
+ *   strava today                          # activities logged today
+ *   strava date 2025-01-15                # activities on a specific date
+ *   strava range 2025-01-01 2025-01-31    # activities across a date range
+ *   strava recent [--days N]              # recent activities (default: 7 days)
+ *   strava athlete                        # athlete profile and stats
+ *
+ * Credentials read from env (or auto-loaded from .env):
+ *   STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN
+ *
+ * Token cache written to /workspace/group/.strava-tokens.json (container)
+ *   or store/.strava-tokens.json (host)
+ */
+
+'use strict';
+
+const https = require('https');
+const fs    = require('fs');
+const path  = require('path');
+
+// ── Load .env when running on host ────────────────────────────────────────────
+
+(function loadDotEnv() {
+  if (fs.existsSync('/workspace/group')) return; // inside container — env already injected
+  const candidates = [
+    path.join(__dirname, '.env'),
+    path.join(__dirname, '..', '.env'),
+    path.join(__dirname, '..', '..', '.env'),
+    path.join(__dirname, '..', '..', '..', '.env'),
+  ];
+  for (const f of candidates) {
+    if (!fs.existsSync(f)) continue;
+    for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+      const t  = line.trim();
+      if (!t || t.startsWith('#')) continue;
+      const eq = t.indexOf('=');
+      if (eq < 0) continue;
+      const key = t.slice(0, eq).trim();
+      const val = t.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+      if (!(key in process.env)) process.env[key] = val;
+    }
+    break;
+  }
+})();
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const TOKEN_URL = 'https://www.strava.com/oauth/token';
+const API       = 'https://www.strava.com/api/v3';
+
+// Token cache location: writable group dir in container, store/ on host
+const TOKEN_CACHE = fs.existsSync('/workspace/group')
+  ? '/workspace/group/.strava-tokens.json'
+  : path.join(__dirname, '..', '..', '..', 'store', '.strava-tokens.json');
+
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+function httpPost(url, formData) {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams(formData).toString();
+    const u    = new URL(url);
+    const opts = {
+      hostname: u.hostname,
+      path:     u.pathname + u.search,
+      method:   'POST',
+      headers: {
+        'Content-Type':   'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = https.request(opts, res => {
+      let raw = '';
+      res.on('data', c => (raw += c));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
+        catch { resolve({ status: res.statusCode, body: raw }); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+function httpGet(url, token) {
+  return new Promise((resolve, reject) => {
+    const u    = new URL(url);
+    const opts = {
+      hostname: u.hostname,
+      path:     u.pathname + u.search,
+      method:   'GET',
+      headers:  { Authorization: `Bearer ${token}` },
+    };
+    const req = https.request(opts, res => {
+      let raw = '';
+      res.on('data', c => (raw += c));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
+        catch { resolve({ status: res.statusCode, body: raw }); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+// ── Token management ──────────────────────────────────────────────────────────
+
+function loadCache() {
+  try { return JSON.parse(fs.readFileSync(TOKEN_CACHE, 'utf8')); }
+  catch { return null; }
+}
+
+function saveCache(tokens) {
+  try {
+    fs.mkdirSync(path.dirname(TOKEN_CACHE), { recursive: true });
+    fs.writeFileSync(TOKEN_CACHE, JSON.stringify(tokens, null, 2));
+    // On host: also write rotated refresh token back to .env
+    if (!fs.existsSync('/workspace/group')) {
+      const envFile = [
+        path.join(__dirname, '..', '..', '..', '.env'),
+        path.join(__dirname, '..', '..', '.env'),
+      ].find(f => fs.existsSync(f));
+      if (envFile) {
+        const lines = fs.readFileSync(envFile, 'utf8').split('\n');
+        const idx   = lines.findIndex(l => l.startsWith('STRAVA_REFRESH_TOKEN='));
+        const entry = `STRAVA_REFRESH_TOKEN=${tokens.refresh_token}`;
+        if (idx >= 0) lines[idx] = entry;
+        else lines.push(entry);
+        fs.writeFileSync(envFile, lines.join('\n'));
+      }
+    }
+  } catch (e) { /* non-fatal */ }
+}
+
+async function getAccessToken() {
+  const clientId     = process.env.STRAVA_CLIENT_ID;
+  const clientSecret = process.env.STRAVA_CLIENT_SECRET;
+  const envRefresh   = process.env.STRAVA_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret) {
+    die('STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET must be set.\nRun: node scripts/strava-setup');
+  }
+
+  const cache = loadCache();
+  const now   = Date.now();
+  if (cache && cache.access_token && cache.expires_at && cache.expires_at > now + 60000) {
+    return cache.access_token;
+  }
+
+  const refreshToken = (cache && cache.refresh_token) || envRefresh;
+  if (!refreshToken) die('No Strava refresh token. Run: node scripts/strava-setup');
+
+  const res = await httpPost(TOKEN_URL, {
+    client_id:     clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    grant_type:    'refresh_token',
+  });
+
+  if (res.status !== 200 || !res.body.access_token) {
+    die(`Token refresh failed (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+  }
+
+  const newCache = {
+    access_token:  res.body.access_token,
+    refresh_token: res.body.refresh_token || refreshToken,
+    expires_at:    now + (res.body.expires_in || 21600) * 1000,
+  };
+  saveCache(newCache);
+  return newCache.access_token;
+}
+
+// ── API helpers ───────────────────────────────────────────────────────────────
+
+// Strava paginates via page number, not cursor
+async function fetchActivities(after, before, token) {
+  const activities = [];
+  let page = 1;
+  while (true) {
+    const q = new URL(`${API}/athlete/activities`);
+    if (after)  q.searchParams.set('after',    String(after));
+    if (before) q.searchParams.set('before',   String(before));
+    q.searchParams.set('per_page', '100');
+    q.searchParams.set('page',     String(page));
+
+    const res = await httpGet(q.toString(), token);
+    if (res.status !== 200) throw new Error(`API ${res.status}: ${JSON.stringify(res.body)}`);
+    if (!Array.isArray(res.body) || res.body.length === 0) break;
+    activities.push(...res.body);
+    if (res.body.length < 100) break;
+    page++;
+  }
+  return activities;
+}
+
+async function fetchAthlete(token) {
+  const res = await httpGet(`${API}/athlete`, token);
+  if (res.status !== 200) throw new Error(`API ${res.status}: ${JSON.stringify(res.body)}`);
+  return res.body;
+}
+
+async function fetchAthleteStats(athleteId, token) {
+  const res = await httpGet(`${API}/athletes/${athleteId}/stats`, token);
+  if (res.status !== 200) throw new Error(`API ${res.status}: ${JSON.stringify(res.body)}`);
+  return res.body;
+}
+
+// ── Date helpers ──────────────────────────────────────────────────────────────
+
+function toUnix(date) { return Math.floor(date.getTime() / 1000); }
+
+function todayRange() {
+  const start = new Date(); start.setHours(0, 0, 0, 0);
+  const end   = new Date(); end.setHours(23, 59, 59, 999);
+  return { after: toUnix(start), before: toUnix(end) };
+}
+
+function dateRange(dateStr) {
+  const start = new Date(dateStr + 'T00:00:00');
+  const end   = new Date(dateStr + 'T23:59:59');
+  return { after: toUnix(start), before: toUnix(end) };
+}
+
+function daysAgoRange(days) {
+  const start = new Date(); start.setDate(start.getDate() - days); start.setHours(0, 0, 0, 0);
+  const end   = new Date(); end.setHours(23, 59, 59, 999);
+  return { after: toUnix(start), before: toUnix(end) };
+}
+
+function rangeFromStrings(startStr, endStr) {
+  return {
+    after:  toUnix(new Date(startStr + 'T00:00:00')),
+    before: toUnix(new Date(endStr   + 'T23:59:59')),
+  };
+}
+
+// ── Formatters ────────────────────────────────────────────────────────────────
+
+function fmtDate(iso) {
+  if (!iso) return 'N/A';
+  return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function fmtDuration(seconds) {
+  if (seconds == null) return 'N/A';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m ${s}s`;
+}
+
+function fmtDist(meters) {
+  if (meters == null) return 'N/A';
+  if (meters >= 1000) return `${(meters / 1000).toFixed(2)} km`;
+  return `${meters.toFixed(0)} m`;
+}
+
+function fmtPace(metersPerSec, sportType) {
+  if (!metersPerSec || metersPerSec === 0) return 'N/A';
+  const type = (sportType || '').toLowerCase();
+  if (type.includes('ride') || type.includes('cycling') || type.includes('virtual')) {
+    // Speed in km/h
+    return `${(metersPerSec * 3.6).toFixed(1)} km/h`;
+  }
+  // Pace in min/km for run/walk/hike
+  const minPerKm = 1000 / metersPerSec / 60;
+  const min = Math.floor(minPerKm);
+  const sec = Math.round((minPerKm - min) * 60);
+  return `${min}:${String(sec).padStart(2, '0')} /km`;
+}
+
+function fmtElevation(meters) {
+  if (meters == null) return 'N/A';
+  return `${meters.toFixed(0)} m`;
+}
+
+function fmtActivity(a) {
+  const lines = [
+    `  [${fmtDate(a.start_date_local)}] ${a.name}  (${a.sport_type || a.type})`,
+    `    Dist:    ${fmtDist(a.distance)}  ·  Time: ${fmtDuration(a.moving_time)}  ·  Elev: ${fmtElevation(a.total_elevation_gain)}`,
+    `    Pace:    ${fmtPace(a.average_speed, a.sport_type || a.type)}  ·  Max: ${fmtPace(a.max_speed, a.sport_type || a.type)}`,
+  ];
+  if (a.average_heartrate != null) {
+    lines.push(`    HR:      avg ${a.average_heartrate.toFixed(0)} bpm  ·  max ${a.max_heartrate != null ? a.max_heartrate.toFixed(0) : 'N/A'} bpm`);
+  }
+  if (a.average_watts != null) {
+    lines.push(`    Power:   ${a.average_watts.toFixed(0)} W avg`);
+  }
+  if (a.suffer_score != null) {
+    lines.push(`    Suffer:  ${a.suffer_score}`);
+  }
+  if (a.kudos_count != null) {
+    lines.push(`    Kudos:   ${a.kudos_count}`);
+  }
+  return lines.join('\n');
+}
+
+function fmtStatBlock(label, stats) {
+  if (!stats) return `  ${label}: N/A`;
+  return [
+    `  ${label}:`,
+    `    Count:    ${stats.count ?? 'N/A'}`,
+    `    Distance: ${fmtDist(stats.distance)}`,
+    `    Time:     ${fmtDuration(stats.moving_time)}`,
+    `    Elevation:${fmtElevation(stats.elevation_gain)}`,
+  ].join('\n');
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+async function cmdToday() {
+  const token      = await getAccessToken();
+  const { after, before } = todayRange();
+  const activities = await fetchActivities(after, before, token);
+
+  const lines = [`── Today (${fmtDate(new Date().toISOString())}) ───────────────────`];
+  if (!activities.length) {
+    lines.push('  No activities logged today.');
+    return lines.join('\n');
+  }
+  activities.forEach(a => { lines.push(''); lines.push(fmtActivity(a)); });
+  return lines.join('\n');
+}
+
+async function cmdDate(dateStr) {
+  const token      = await getAccessToken();
+  const { after, before } = dateRange(dateStr);
+  const activities = await fetchActivities(after, before, token);
+
+  const lines = [`── ${fmtDate(dateStr + 'T12:00:00')} ──────────────────────`];
+  if (!activities.length) {
+    lines.push(`  No activities on ${dateStr}.`);
+    return lines.join('\n');
+  }
+  activities.forEach(a => { lines.push(''); lines.push(fmtActivity(a)); });
+  return lines.join('\n');
+}
+
+async function cmdRange(startStr, endStr) {
+  const token      = await getAccessToken();
+  const { after, before } = rangeFromStrings(startStr, endStr);
+  const activities = await fetchActivities(after, before, token);
+
+  const lines = [`── Strava ${startStr} → ${endStr} ──────────────────`];
+  if (!activities.length) {
+    lines.push('  No activities in this period.');
+    return lines.join('\n');
+  }
+
+  // Summary
+  const totalDist = activities.reduce((s, a) => s + (a.distance || 0), 0);
+  const totalTime = activities.reduce((s, a) => s + (a.moving_time || 0), 0);
+  const totalElev = activities.reduce((s, a) => s + (a.total_elevation_gain || 0), 0);
+  lines.push('');
+  lines.push(`  Summary: ${activities.length} activities  ·  ${fmtDist(totalDist)}  ·  ${fmtDuration(totalTime)}  ·  ${fmtElevation(totalElev)} gain`);
+
+  // Group by sport type
+  const bySport = {};
+  for (const a of activities) {
+    const sport = a.sport_type || a.type || 'Other';
+    if (!bySport[sport]) bySport[sport] = [];
+    bySport[sport].push(a);
+  }
+  for (const [sport, list] of Object.entries(bySport)) {
+    const d = list.reduce((s, a) => s + (a.distance || 0), 0);
+    const t = list.reduce((s, a) => s + (a.moving_time || 0), 0);
+    lines.push(`  ${sport}: ${list.length}x  ·  ${fmtDist(d)}  ·  ${fmtDuration(t)}`);
+  }
+
+  lines.push('');
+  lines.push('── Activities ─────────────────────────────────');
+  activities.forEach(a => { lines.push(''); lines.push(fmtActivity(a)); });
+  return lines.join('\n');
+}
+
+async function cmdRecent(days) {
+  const token      = await getAccessToken();
+  const { after, before } = daysAgoRange(days);
+  const activities = await fetchActivities(after, before, token);
+
+  const lines = [`── Recent activities (last ${days} days) ─────────────────`];
+  if (!activities.length) {
+    lines.push('  No activities found.');
+    return lines.join('\n');
+  }
+
+  const totalDist = activities.reduce((s, a) => s + (a.distance || 0), 0);
+  const totalTime = activities.reduce((s, a) => s + (a.moving_time || 0), 0);
+  lines.push(`  ${activities.length} activities  ·  ${fmtDist(totalDist)} total  ·  ${fmtDuration(totalTime)} moving`);
+
+  activities.forEach(a => { lines.push(''); lines.push(fmtActivity(a)); });
+  return lines.join('\n');
+}
+
+async function cmdAthlete() {
+  const token   = await getAccessToken();
+  const athlete = await fetchAthlete(token);
+
+  const lines = ['── Strava Athlete ──────────────────────────'];
+  lines.push(`  Name:      ${athlete.firstname} ${athlete.lastname}`);
+  lines.push(`  Username:  ${athlete.username || 'N/A'}`);
+  lines.push(`  City:      ${athlete.city || 'N/A'}`);
+  lines.push(`  Country:   ${athlete.country || 'N/A'}`);
+  lines.push(`  Followers: ${athlete.follower_count ?? 'N/A'}  ·  Following: ${athlete.friend_count ?? 'N/A'}`);
+  lines.push(`  FTP:       ${athlete.ftp != null ? athlete.ftp + ' W' : 'N/A'}`);
+  lines.push(`  Weight:    ${athlete.weight != null ? athlete.weight + ' kg' : 'N/A'}`);
+
+  try {
+    const stats = await fetchAthleteStats(athlete.id, token);
+    lines.push('');
+    lines.push('── YTD Stats ──────────────────────────────');
+    if (stats.ytd_run_totals)  lines.push(fmtStatBlock('Run YTD',  stats.ytd_run_totals));
+    if (stats.ytd_ride_totals) lines.push(fmtStatBlock('Ride YTD', stats.ytd_ride_totals));
+    if (stats.ytd_swim_totals) lines.push(fmtStatBlock('Swim YTD', stats.ytd_swim_totals));
+    lines.push('');
+    lines.push('── All-time Stats ─────────────────────────');
+    if (stats.all_run_totals)  lines.push(fmtStatBlock('Run all-time',  stats.all_run_totals));
+    if (stats.all_ride_totals) lines.push(fmtStatBlock('Ride all-time', stats.all_ride_totals));
+    if (stats.all_swim_totals) lines.push(fmtStatBlock('Swim all-time', stats.all_swim_totals));
+  } catch (e) { /* stats optional */ }
+
+  return lines.join('\n');
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+function die(msg) { console.error('Error:', msg); process.exit(1); }
+
+function usage() {
+  console.log(`Usage:
+  strava today
+  strava date YYYY-MM-DD
+  strava range YYYY-MM-DD YYYY-MM-DD
+  strava recent [--days N]
+  strava athlete`);
+  process.exit(1);
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const cmd  = args[0];
+  if (!cmd) usage();
+
+  try {
+    let out;
+    switch (cmd) {
+      case 'today':   out = await cmdToday(); break;
+      case 'date':    if (!args[1]) die('date requires YYYY-MM-DD'); out = await cmdDate(args[1]); break;
+      case 'range':   if (!args[1] || !args[2]) die('range requires two dates'); out = await cmdRange(args[1], args[2]); break;
+      case 'recent':  { const d = args.includes('--days') ? parseInt(args[args.indexOf('--days') + 1]) : 7; out = await cmdRecent(d); break; }
+      case 'athlete': out = await cmdAthlete(); break;
+      default: usage();
+    }
+    console.log(out);
+  } catch (err) {
+    die(err.message);
+  }
+}
+
+main();
