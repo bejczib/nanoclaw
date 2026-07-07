@@ -26,8 +26,24 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+
+// Environment variables from .env that should be forwarded to containers.
+// These are used by container skills (WHOOP, Strava, Sheets) that read
+// credentials and config via process.env. The values are injected as -e
+// flags — the .env file itself is shadowed with /dev/null.
+const FORWARDED_ENV_KEYS = [
+  'WHOOP_CLIENT_ID',
+  'WHOOP_CLIENT_SECRET',
+  'WHOOP_REFRESH_TOKEN',
+  'STRAVA_CLIENT_ID',
+  'STRAVA_CLIENT_SECRET',
+  'STRAVA_REFRESH_TOKEN',
+  'GOOGLE_SHEETS_KEY_JSON',
+  'GOOGLE_SHEETS_ID',
+];
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -265,6 +281,12 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Forward skill credentials from .env into the container
+  const skillEnv = readEnvFile(FORWARDED_ENV_KEYS);
+  for (const [key, value] of Object.entries(skillEnv)) {
+    args.push('-e', `${key}=${value}`);
   }
 
   // Runtime-specific args for host gateway resolution

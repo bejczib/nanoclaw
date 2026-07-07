@@ -1,0 +1,1248 @@
+#!/usr/bin/env node
+/**
+ * sheets — read/write Google Sheets for coaching data
+ *
+ * Usage:
+ *   sheets init                          # create tabs + headers if missing
+ *   sheets log-workout '<json>'          # append row to Workout Log tab
+ *   sheets log-plan '<json>'             # append row to Weekly Plans tab
+ *   sheets log-recovery '<json>'         # append row to Recovery Trends tab
+ *   sheets get-plan [--week YYYY-MM-DD]  # read plan for given week (default: current)
+ *   sheets get-workouts [--days N]       # read last N days from Workout Log (default: 7)
+ *
+ * Credentials read from env (or auto-loaded from .env):
+ *   GOOGLE_SHEETS_KEY_JSON  — base64-encoded service account JSON
+ *   GOOGLE_SHEETS_ID        — spreadsheet ID
+ */
+
+'use strict';
+
+const https  = require('https');
+const fs     = require('fs');
+const path   = require('path');
+const crypto = require('crypto');
+
+// ── Load .env when running on host ────────────────────────────────────────────
+
+(function loadDotEnv() {
+  if (fs.existsSync('/workspace/group')) return;
+  const candidates = [
+    path.join(__dirname, '.env'),
+    path.join(__dirname, '..', '.env'),
+    path.join(__dirname, '..', '..', '.env'),
+    path.join(__dirname, '..', '..', '..', '.env'),
+  ];
+  for (const f of candidates) {
+    if (!fs.existsSync(f)) continue;
+    for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+      const t  = line.trim();
+      if (!t || t.startsWith('#')) continue;
+      const eq = t.indexOf('=');
+      if (eq < 0) continue;
+      const key = t.slice(0, eq).trim();
+      const val = t.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+      if (!(key in process.env)) process.env[key] = val;
+    }
+    break;
+  }
+})();
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const SHEETS_API  = 'https://sheets.googleapis.com/v4/spreadsheets';
+const TOKEN_URL   = 'https://oauth2.googleapis.com/token';
+// Token cache: shared store/ — same file on host and container. Prevents
+// host/container from invalidating each other's rotated refresh_token.
+function resolveTokenCache(name) {
+  const containerStore = '/workspace/project/store';
+  try { fs.accessSync(containerStore, fs.constants.W_OK); return `${containerStore}/${name}`; }
+  catch {}
+  if (fs.existsSync('/workspace/group')) return `/workspace/group/${name}`;
+  return path.join(__dirname, '..', '..', '..', 'store', name);
+}
+const TOKEN_CACHE = resolveTokenCache('.sheets-tokens.json');
+
+const TAB_PLANS     = 'Weekly Plans';
+const TAB_WORKOUTS  = 'Workout Log';
+const TAB_RECOVERY  = 'Recovery Trends';
+const TAB_FITNESS   = 'Fitness Trend';
+
+const HEADERS = {
+  [TAB_PLANS]:    ['Week Start', 'Week #', 'Phase', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun', 'Volume Target (km)', 'Coach Notes'],
+  [TAB_WORKOUTS]: ['Date', 'Day', 'Sport', 'Distance (km)', 'Duration', 'Avg HR', 'Avg Pace / Power', 'Status', 'Notes', 'Coach Note'],
+  [TAB_RECOVERY]: ['Date', 'Recovery %', 'HRV (ms)', 'RHR', 'SpO2 %', 'Strain', 'Sleep Score %', 'Sleep Duration', 'Coach Note'],
+  [TAB_FITNESS]:  ['Date', 'VDOT', 'AE Index', '7d Avg HRV', '28d Volume (km)', '7d Avg Recovery %'],
+};
+
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+function httpRequest(method, url, token, bodyObj) {
+  return new Promise((resolve, reject) => {
+    const body = bodyObj ? JSON.stringify(bodyObj) : null;
+    const u    = new URL(url);
+    const opts = {
+      hostname: u.hostname,
+      path:     u.pathname + u.search,
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
+      },
+    };
+    const req = https.request(opts, res => {
+      let raw = '';
+      res.on('data', c => (raw += c));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
+        catch { resolve({ status: res.statusCode, body: raw }); }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+function httpPostForm(url, formData) {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams(formData).toString();
+    const u    = new URL(url);
+    const opts = {
+      hostname: u.hostname,
+      path:     u.pathname + u.search,
+      method:   'POST',
+      headers: {
+        'Content-Type':   'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = https.request(opts, res => {
+      let raw = '';
+      res.on('data', c => (raw += c));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
+        catch { resolve({ status: res.statusCode, body: raw }); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── JWT + Token management ────────────────────────────────────────────────────
+
+function base64url(input) {
+  return Buffer.from(input)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
+}
+
+function makeJWT(clientEmail, privateKey) {
+  const now     = Math.floor(Date.now() / 1000);
+  const header  = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const payload = base64url(JSON.stringify({
+    iss:   clientEmail,
+    scope: 'https://www.googleapis.com/auth/spreadsheets',
+    aud:   TOKEN_URL,
+    exp:   now + 3600,
+    iat:   now,
+  }));
+  const unsigned  = `${header}.${payload}`;
+  const sign      = crypto.createSign('RSA-SHA256');
+  sign.update(unsigned);
+  const signature = sign.sign(privateKey, 'base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '');
+  return `${unsigned}.${signature}`;
+}
+
+function loadKeyJson() {
+  const raw = process.env.GOOGLE_SHEETS_KEY_JSON;
+  if (!raw) die('GOOGLE_SHEETS_KEY_JSON is not set.\nSee setup instructions in the sheets skill SKILL.md.');
+  try {
+    return JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
+  } catch {
+    die('GOOGLE_SHEETS_KEY_JSON is not valid base64-encoded JSON.');
+  }
+}
+
+function loadTokenCache() {
+  try { return JSON.parse(fs.readFileSync(TOKEN_CACHE, 'utf8')); }
+  catch { return null; }
+}
+
+function saveTokenCache(token, expiresAt) {
+  try {
+    fs.mkdirSync(path.dirname(TOKEN_CACHE), { recursive: true });
+    fs.writeFileSync(TOKEN_CACHE, JSON.stringify({ token, expiresAt }, null, 2));
+  } catch { /* non-fatal */ }
+}
+
+async function getAccessToken() {
+  const cache = loadTokenCache();
+  if (cache && cache.token && cache.expiresAt > Date.now() + 60000) {
+    return cache.token;
+  }
+
+  const key    = loadKeyJson();
+  const jwt    = makeJWT(key.client_email, key.private_key);
+  const res    = await httpPostForm(TOKEN_URL, {
+    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+    assertion:  jwt,
+  });
+
+  if (res.status !== 200 || !res.body.access_token) {
+    die(`Token request failed (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+  }
+
+  const expiresAt = Date.now() + (res.body.expires_in || 3600) * 1000;
+  saveTokenCache(res.body.access_token, expiresAt);
+  return res.body.access_token;
+}
+
+// ── Sheets API helpers ────────────────────────────────────────────────────────
+
+function sheetId() {
+  const id = process.env.GOOGLE_SHEETS_ID;
+  if (!id) die('GOOGLE_SHEETS_ID is not set.');
+  return id;
+}
+
+async function getSpreadsheetMeta(token) {
+  const url = `${SHEETS_API}/${sheetId()}?fields=sheets.properties,sheets.charts`;
+  const res = await httpRequest('GET', url, token);
+  if (res.status !== 200) die(`Failed to get spreadsheet metadata (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+  return res.body;
+}
+
+async function createSheet(token, title) {
+  const url = `${SHEETS_API}/${sheetId()}:batchUpdate`;
+  const res = await httpRequest('POST', url, token, {
+    requests: [{ addSheet: { properties: { title } } }],
+  });
+  if (res.status !== 200) die(`Failed to create sheet "${title}" (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+}
+
+async function batchWriteValues(token, data) {
+  const url = `${SHEETS_API}/${sheetId()}/values:batchUpdate`;
+  const res = await httpRequest('POST', url, token, { valueInputOption: 'USER_ENTERED', data });
+  if (res.status !== 200) die(`Failed to write values (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+}
+
+async function clearRange(token, range) {
+  const r   = encodeURIComponent(range);
+  const url = `${SHEETS_API}/${sheetId()}/values/${r}:clear`;
+  const res = await httpRequest('POST', url, token, {});
+  if (res.status !== 200) die(`Failed to clear range "${range}" (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+}
+
+async function appendRows(token, tabName, rows) {
+  const range = encodeURIComponent(`${tabName}!A1`);
+  const url   = `${SHEETS_API}/${sheetId()}/values/${range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+  const res   = await httpRequest('POST', url, token, { values: rows });
+  if (res.status !== 200) die(`Failed to append rows to "${tabName}" (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+  return res.body;
+}
+
+async function readRows(token, tabName, range) {
+  const r   = encodeURIComponent(range || `${tabName}!A:Z`);
+  const url = `${SHEETS_API}/${sheetId()}/values/${r}`;
+  const res = await httpRequest('GET', url, token);
+  if (res.status !== 200) die(`Failed to read "${tabName}" (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+  return res.body.values || [];
+}
+
+// ── Fitness calculation helpers ───────────────────────────────────────────────
+
+// VDOT from Jack Daniels formula. Returns null if inputs are invalid/too easy.
+function calcVdot(distanceM, timeSec) {
+  if (!distanceM || !timeSec || distanceM < 1000) return null;
+  const t   = timeSec / 60;                   // minutes
+  const v   = distanceM / t;                  // m/min
+  const pct = 0.8 + 0.1894393 * Math.exp(-0.012778 * t)
+                  + 0.2989558 * Math.exp(-0.1932605 * t);
+  const vo2 = -4.60 + 0.182258 * v + 0.000104 * v * v;
+  const vdot = vo2 / pct;
+  if (vdot < 30 || vdot > 85) return null; // sanity bounds
+  return Math.round(vdot * 10) / 10;
+}
+
+// AE Index: running speed (m/min) / avg_hr * 100. Higher = more aerobically efficient.
+function calcAE(distanceM, timeSec, avgHr) {
+  if (!avgHr || avgHr < 80 || !distanceM || !timeSec) return null;
+  const speedMperMin = distanceM / (timeSec / 60);
+  return Math.round((speedMperMin / avgHr) * 100) / 100;
+}
+
+// Classify Strava running activity into effort type
+function classifyEffort(distanceM, timeSec, sufferScore) {
+  const paceSecPerKm = timeSec / (distanceM / 1000);
+  const distKm       = distanceM / 1000;
+  const suffer       = sufferScore || 0;
+  if (suffer >= 130 && paceSecPerKm <= 4 * 60 + 15) return 'Race';
+  if (suffer >= 60  && paceSecPerKm <= 4 * 60 + 30 && distKm >= 5) return 'Tempo';
+  if (distKm >= 18) return 'Long';
+  return 'Easy';
+}
+
+function fmtTime(totalSec) {
+  // Always use H:MM:SS so Sheets stores as proper duration, not mis-parsed as "HH:MM" (43h 01m)
+  const ts = Math.round(totalSec);
+  const h  = Math.floor(ts / 3600);
+  const m  = Math.floor((ts % 3600) / 60);
+  const s  = ts % 60;
+  return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function fmtPace(distanceM, timeSec) {
+  const secPerKm = timeSec / (distanceM / 1000);
+  const m = Math.floor(secPerKm / 60);
+  const s = Math.round(secPerKm % 60);
+  return `${m}:${String(s).padStart(2, '0')}/km`;
+}
+
+// ── External API token helpers (for backfill) ─────────────────────────────────
+
+async function getStravaToken() {
+  const cacheFile = resolveTokenCache('.strava-tokens.json');
+
+  const clientId     = process.env.STRAVA_CLIENT_ID;
+  const clientSecret = process.env.STRAVA_CLIENT_SECRET;
+  const envRefresh   = process.env.STRAVA_REFRESH_TOKEN;
+
+  let cache = null;
+  try { cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch {}
+
+  const now = Date.now();
+  if (cache && cache.access_token && cache.expires_at > now + 60000) return cache.access_token;
+
+  const refreshToken = (cache && cache.refresh_token) || envRefresh;
+  if (!clientId || !clientSecret || !refreshToken) {
+    die('Strava credentials missing. Set STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN in .env');
+  }
+
+  const res = await httpPostForm('https://www.strava.com/oauth/token', {
+    client_id:     clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    grant_type:    'refresh_token',
+  });
+  if (res.status !== 200 || !res.body.access_token) die(`Strava token refresh failed: ${JSON.stringify(res.body)}`);
+
+  const newCache = {
+    access_token:  res.body.access_token,
+    refresh_token: res.body.refresh_token || refreshToken,
+    expires_at:    now + (res.body.expires_in || 21600) * 1000,
+  };
+  try {
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    fs.writeFileSync(cacheFile, JSON.stringify(newCache, null, 2));
+  } catch {}
+  return newCache.access_token;
+}
+
+async function getWhoopToken() {
+  const cacheFile = fs.existsSync('/workspace/group')
+    ? '/workspace/group/.whoop-tokens.json'
+    : path.join(__dirname, '..', '..', '..', 'store', '.whoop-tokens.json');
+
+  const clientId     = process.env.WHOOP_CLIENT_ID;
+  const clientSecret = process.env.WHOOP_CLIENT_SECRET;
+  const envRefresh   = process.env.WHOOP_REFRESH_TOKEN;
+
+  let cache = null;
+  try { cache = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch {}
+
+  const now = Date.now();
+  if (cache && cache.access_token && cache.expires_at > now + 60000) return cache.access_token;
+
+  const refreshToken = (cache && cache.refresh_token) || envRefresh;
+  if (!clientId || !clientSecret || !refreshToken) {
+    die('WHOOP credentials missing. Set WHOOP_CLIENT_ID, WHOOP_CLIENT_SECRET, WHOOP_REFRESH_TOKEN in .env');
+  }
+
+  const res = await httpPostForm('https://api.prod.whoop.com/oauth/oauth2/token', {
+    grant_type:    'refresh_token',
+    client_id:     clientId,
+    client_secret: clientSecret,
+    redirect_uri:  'http://localhost:9877/callback',
+    refresh_token: refreshToken,
+  });
+  if (res.status !== 200 || !res.body.access_token) die(`WHOOP token refresh failed: ${JSON.stringify(res.body)}`);
+
+  const newCache = {
+    access_token:  res.body.access_token,
+    refresh_token: res.body.refresh_token || refreshToken,
+    expires_at:    now + (res.body.expires_in || 3600) * 1000,
+  };
+  try {
+    fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+    fs.writeFileSync(cacheFile, JSON.stringify(newCache, null, 2));
+  } catch {}
+  return newCache.access_token;
+}
+
+// ── Date helpers ──────────────────────────────────────────────────────────────
+
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function dayName(dateStr) {
+  return new Date(dateStr + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'short' });
+}
+
+function daysAgo(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d.toISOString().slice(0, 10);
+}
+
+function currentMondayStr() {
+  const d   = new Date();
+  const day = d.getDay(); // 0=Sun, 1=Mon...
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return d.toISOString().slice(0, 10);
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+async function cmdInit() {
+  const token = await getAccessToken();
+  const meta  = await getSpreadsheetMeta(token);
+  const existing = new Set((meta.sheets || []).map(s => s.properties.title));
+
+  const created = [];
+  for (const tabName of [TAB_PLANS, TAB_WORKOUTS, TAB_RECOVERY, TAB_FITNESS]) {
+    if (!existing.has(tabName)) {
+      await createSheet(token, tabName);
+      await appendRows(token, tabName, [HEADERS[tabName]]);
+      created.push(tabName);
+    }
+  }
+
+  if (created.length === 0) {
+    return '✓ All tabs already exist: Weekly Plans, Workout Log, Recovery Trends, Fitness Trend';
+  }
+  return `✓ Created tabs: ${created.join(', ')}\n✓ Headers written`;
+}
+
+async function cmdLogWorkout(jsonStr) {
+  const d     = parseJsonArg(jsonStr);
+  const token = await getAccessToken();
+  const date  = d.date || todayStr();
+  const row   = [
+    date,
+    dayName(date),
+    d.sport    || '',
+    (d.actual_distance ?? d.distance) != null ? +(d.actual_distance ?? d.distance) : '',
+    d.actual_duration || d.duration || '',
+    d.avg_hr   != null ? +d.avg_hr   : '',
+    d.avg_pace || d.avg_power || '',
+    d.status     || '',
+    d.notes      || '',
+    d.coach_note || '',
+  ];
+
+  // Always append (insert at top so newest-first). Caller is responsible for not
+  // re-processing the same workout — multiple workouts per day are supported.
+  const meta  = await getSpreadsheetMeta(token);
+  const sheet = (meta.sheets || []).find(s => s.properties.title === TAB_WORKOUTS);
+  if (!sheet) die('Workout Log tab not found. Run: sheets init');
+  const wsId  = sheet.properties.sheetId;
+
+  const batchUrl = `${SHEETS_API}/${sheetId()}:batchUpdate`;
+  const batchRes = await httpRequest('POST', batchUrl, token, {
+    requests: [{
+      insertDimension: {
+        range: { sheetId: wsId, dimension: 'ROWS', startIndex: 1, endIndex: 2 },
+        inheritFromBefore: false,
+      },
+    }],
+  });
+  if (batchRes.status !== 200) die(`Failed to insert row (HTTP ${batchRes.status}): ${JSON.stringify(batchRes.body)}`);
+
+  await writeRow(token, TAB_WORKOUTS, 2, row);
+  return `✓ Logged workout for ${date}: ${d.sport || 'activity'} ${d.distance ? d.distance + 'km' : ''} ${d.avg_pace || ''}`.trim();
+}
+
+// Write or update the Coach Note for a specific date's workout row
+async function cmdCoachNote(jsonStr) {
+  const d     = parseJsonArg(jsonStr);
+  const token = await getAccessToken();
+  const date  = d.date || todayStr();
+  const note  = d.note || d.coach_note || '';
+  if (!note) die('Provide "note" or "coach_note" field in JSON');
+
+  // Find the row index with matching date
+  const rows = await readRows(token, TAB_WORKOUTS);
+  let rowIdx = -1;
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i][0] === date) { rowIdx = i + 1; break; } // 1-based sheet row
+  }
+  if (rowIdx === -1) die(`No workout row found for date ${date} in Workout Log`);
+
+  // Write only column J (Coach Note = col 10, 1-based)
+  const range = encodeURIComponent(`${TAB_WORKOUTS}!J${rowIdx}`);
+  const url   = `${SHEETS_API}/${sheetId()}/values/${range}?valueInputOption=RAW`;
+  const res   = await httpRequest('PUT', url, token, { values: [[note]] });
+  if (res.status !== 200) die(`Failed to write coach note (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+  return `✓ Coach note written to Workout Log row ${rowIdx} (${date})`;
+}
+
+async function cmdLogPlan(jsonStr) {
+  const d = parseJsonArg(jsonStr);
+  const token = await getAccessToken();
+
+  const weekStart = d.week_start || currentMondayStr();
+  const row = [
+    `'${weekStart}`,
+    d.week_num    != null ? String(d.week_num) : '',
+    d.phase       || '',
+    d.mon         || '',
+    d.tue         || '',
+    d.wed         || '',
+    d.thu         || '',
+    d.fri         || '',
+    d.sat         || '',
+    d.sun         || '',
+    d.volume_target != null ? String(d.volume_target) : '',
+    d.coach_notes || '',
+  ];
+
+  // Upsert: update existing row if week_start matches, otherwise append
+  const rows = await readRows(token, TAB_PLANS);
+  let existingIdx = -1;
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i][0] === weekStart) { existingIdx = i + 1; break; } // 1-based sheet row
+  }
+
+  if (existingIdx > 0) {
+    await writeRow(token, TAB_PLANS, existingIdx, row);
+    return `✓ Updated plan for week of ${weekStart} (${d.phase || 'unknown phase'})`;
+  }
+  await appendRows(token, TAB_PLANS, [row]);
+  return `✓ Logged plan for week of ${weekStart} (${d.phase || 'unknown phase'})`;
+}
+
+async function cmdLogRecovery(jsonStr) {
+  const d = parseJsonArg(jsonStr);
+  const token = await getAccessToken();
+
+  const date = d.date || todayStr();
+  const row  = [
+    date,
+    d.recovery_pct    != null ? String(d.recovery_pct) : '',
+    d.hrv             != null ? String(d.hrv) : '',
+    d.rhr             != null ? String(d.rhr) : '',
+    d.spo2            != null ? String(d.spo2) : '',
+    d.strain          != null ? String(d.strain) : '',
+    d.sleep_score     != null ? String(d.sleep_score) : '',
+    d.sleep_duration  || '',
+    d.note            || '',
+  ];
+
+  // Insert at top (row 2, after header) to keep newest-first order
+  const meta  = await getSpreadsheetMeta(token);
+  const sheet = (meta.sheets || []).find(s => s.properties.title === TAB_RECOVERY);
+  if (!sheet) die('Recovery Trends tab not found. Run: sheets init');
+  const wsId  = sheet.properties.sheetId;
+  const batchUrl = `${SHEETS_API}/${sheetId()}:batchUpdate`;
+  const batchRes = await httpRequest('POST', batchUrl, token, {
+    requests: [{ insertDimension: {
+      range: { sheetId: wsId, dimension: 'ROWS', startIndex: 1, endIndex: 2 },
+      inheritFromBefore: false,
+    }}],
+  });
+  if (batchRes.status !== 200) die(`Failed to insert row (HTTP ${batchRes.status}): ${JSON.stringify(batchRes.body)}`);
+  await writeRow(token, TAB_RECOVERY, 2, row);
+  return `✓ Logged recovery for ${date}: ${d.recovery_pct != null ? d.recovery_pct + '%' : ''} ${d.hrv ? 'HRV ' + d.hrv + 'ms' : ''}`.trim();
+}
+
+async function cmdGetPlan(weekStr) {
+  const token  = await getAccessToken();
+  const rows   = await readRows(token, TAB_PLANS);
+  if (rows.length <= 1) return 'No plans logged yet.';
+
+  const headers = rows[0];
+  const target  = weekStr || currentMondayStr();
+
+  // Find the row with matching week start, or the most recent one
+  const dataRows = rows.slice(1);
+  let match = dataRows.find(r => r[0] === target);
+  if (!match) {
+    // Return most recent
+    match = dataRows[dataRows.length - 1];
+  }
+
+  if (!match) return 'No plan found.';
+
+  const lines = [`── Weekly Plan: ${match[0] || 'unknown week'} ─────────────────────`];
+  lines.push(`  Week #: ${match[1] || 'N/A'}  |  Phase: ${match[2] || 'N/A'}  |  Target volume: ${match[10] || 'N/A'} km`);
+  lines.push('');
+  const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  days.forEach((day, i) => {
+    const session = match[3 + i] || 'rest';
+    lines.push(`  ${day}: ${session}`);
+  });
+  if (match[11]) {
+    lines.push('');
+    lines.push(`  Coach notes: ${match[11]}`);
+  }
+  return lines.join('\n');
+}
+
+async function cmdGetWorkouts(days) {
+  const token  = await getAccessToken();
+  const rows   = await readRows(token, TAB_WORKOUTS);
+  if (rows.length <= 1) return 'No workouts logged yet.';
+
+  const cutoff  = daysAgo(days);
+  const headers = rows[0];
+  const data    = rows.slice(1).filter(r => r[0] && r[0] >= cutoff);
+
+  if (!data.length) return `No workouts logged in the last ${days} days.`;
+
+  // Cols: 0=Date 1=Day 2=Sport 3=Distance 4=Duration 5=HR 6=Pace/Power 7=Status 8=Notes 9=Coach Note
+  const lines = [`── Workout Log: last ${days} days ─────────────────────`];
+  for (const r of data) {
+    lines.push('');
+    const status = r[7] ? ` [${r[7]}]` : '';
+    lines.push(`  [${r[0] || '?'}] ${r[1] || ''} — ${r[2] || 'activity'}${status}`);
+    const detail = [r[3] ? r[3] + ' km' : '', r[4] || '', r[6] ? 'avg ' + r[6] : '', r[5] ? 'HR ' + r[5] : ''].filter(Boolean).join('  ·  ');
+    if (detail) lines.push(`    ${detail}`);
+    if (r[8]) lines.push(`    ${r[8]}`);
+    if (r[9]) lines.push(`    Coach: ${r[9]}`);
+  }
+  lines.push('');
+  lines.push(`  Total: ${data.length} workouts`);
+  const totalKm = data.reduce((s, r) => s + (parseFloat(r[3]) || 0), 0);
+  if (totalKm > 0) lines.push(`  Distance: ${totalKm.toFixed(1)} km`);
+  return lines.join('\n');
+}
+
+async function cmdLogFitness(jsonStr) {
+  const d     = parseJsonArg(jsonStr);
+  const token = await getAccessToken();
+
+  // Cols: 0=Date 1=VDOT 2=AE Index 3=7d HRV 4=28d Volume 5=7d Recovery %
+  const date = d.date || todayStr();
+  const row  = [
+    date,
+    d.vdot        != null ? +d.vdot        : '',
+    d.ae_index    != null ? +d.ae_index    : '',
+    d.hrv_7d      != null ? +d.hrv_7d      : '',
+    d.volume_28d  != null ? +d.volume_28d  : '',
+    d.recovery_7d != null ? +d.recovery_7d : '',
+  ];
+  await appendRows(token, TAB_FITNESS, [row]);
+  const vdotStr = d.vdot ? ` VDOT ${d.vdot}` : '';
+  return `✓ Logged fitness snapshot for ${date}:${vdotStr} AE ${d.ae_index || '—'}`.trim();
+}
+
+async function cmdGetFitness(days) {
+  const token  = await getAccessToken();
+  const rows   = await readRows(token, TAB_FITNESS);
+  if (rows.length <= 1) return 'No fitness data logged yet. Run: sheets backfill-fitness';
+
+  const cutoff = daysAgo(days);
+  const data   = rows.slice(1).filter(r => r[0] && r[0] >= cutoff);
+
+  if (!data.length) return `No fitness data in the last ${days} days.`;
+
+  // Cols: 0=Date 1=VDOT 2=AE Index 3=7d HRV 4=28d Volume 5=7d Recovery %
+  const lines = [`── Fitness Trend: last ${days} days ─────────────────────`];
+  for (const r of data) {
+    const vdot = r[1] ? `VDOT ${r[1]}` : '        —';
+    const ae   = r[2] ? `AE ${r[2]}` : '';
+    const hrv  = r[3] ? `HRV ${r[3]}ms` : '';
+    const vol  = r[4] ? `28d ${r[4]}km` : '';
+    const rec  = r[5] ? `Rec ${r[5]}%` : '';
+    const meta = [ae, hrv, vol, rec].filter(Boolean).join('  ·  ');
+    lines.push(`  [${r[0]}] ${vdot}`);
+    if (meta) lines.push(`         ${meta}`);
+  }
+
+  const vdots = data.map(r => parseFloat(r[1])).filter(v => !isNaN(v));
+  if (vdots.length >= 2) {
+    lines.push('');
+    lines.push(`  VDOT range: ${Math.min(...vdots)} → ${Math.max(...vdots)} (${vdots.length} quality efforts)`);
+    const recent3 = vdots.slice(-3);
+    const early3  = vdots.slice(0, 3);
+    if (recent3.length >= 2 && early3.length >= 2) {
+      const trend = (recent3.reduce((a,b) => a+b,0)/recent3.length) - (early3.reduce((a,b) => a+b,0)/early3.length);
+      lines.push(`  Trend: ${trend > 0 ? '+' : ''}${trend.toFixed(1)} VDOT vs start of period`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+async function cmdBackfillFitness() {
+  const token = await getAccessToken();
+  process.stderr.write('Reading Workout Log...\n');
+
+  // ── 1. Read Workout Log ────────────────────────────────────────────────────
+  // Cols: 0=Date 1=Day 2=Sport 3=Distance(km) 4=Duration 5=HR 6=Pace/Power 7=Status 8=Notes 9=CoachNote
+  const runTypes   = new Set(['Run', 'VirtualRun', 'TrailRun']);
+  const workoutRows = await readRows(token, TAB_WORKOUTS);
+
+  // Parse duration string "H:MM:SS" → seconds
+  function parseDuration(raw) {
+    if (!raw) return 0;
+    if (typeof raw === 'number') return Math.round(raw * 86400); // Sheets TIME fraction
+    const parts = String(raw).split(':').map(Number);
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    return 0;
+  }
+
+  const runs = [];
+  for (const r of workoutRows.slice(1)) {
+    const date  = r[0];
+    const sport = r[2];
+    if (!date || !runTypes.has(sport)) continue;
+    const distKm = parseFloat(r[3]) || 0;
+    if (distKm < 0.5) continue;
+    const durationSec = parseDuration(r[4]);
+    if (durationSec < 60) continue;
+    const avgHr = parseFloat(r[5]) || null;
+    runs.push({ date, distKm, distM: distKm * 1000, durationSec, avgHr });
+  }
+  runs.sort((a, b) => a.date.localeCompare(b.date));
+  process.stderr.write(`  ${runs.length} runs parsed\n`);
+
+  // ── 2. Read Recovery Trends ────────────────────────────────────────────────
+  // Cols: 0=Date 1=Recovery% 2=HRV 3=RHR 4=SpO2 5=Strain 6=Sleep Score 7=Sleep Duration 8=Coach Note
+  process.stderr.write('Reading Recovery Trends...\n');
+  const recoveryRows = await readRows(token, TAB_RECOVERY);
+  const hrvByDate      = {};
+  const recoveryByDate = {};
+  for (const r of recoveryRows.slice(1)) {
+    const date = r[0];
+    if (!date) continue;
+    const hrv = parseFloat(r[2]);
+    const rec = parseFloat(r[1]);
+    if (!isNaN(hrv)) hrvByDate[date]      = hrv;
+    if (!isNaN(rec)) recoveryByDate[date] = rec;
+  }
+  process.stderr.write(`  ${Object.keys(hrvByDate).length} recovery records\n`);
+
+  // ── 3. Rolling helpers ─────────────────────────────────────────────────────
+  function rolling7d(byDate, date) {
+    const vals = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(date + 'T12:00:00'); d.setDate(d.getDate() - i);
+      const ds = d.toISOString().slice(0, 10);
+      if (byDate[ds] != null) vals.push(byDate[ds]);
+    }
+    if (!vals.length) return null;
+    return Math.round((vals.reduce((a, b) => a + b, 0) / vals.length) * 10) / 10;
+  }
+
+  function rolling28dVolume(date) {
+    const cutoff = new Date(date + 'T12:00:00'); cutoff.setDate(cutoff.getDate() - 27);
+    const cutoffStr = cutoff.toISOString().slice(0, 10);
+    return Math.round(
+      runs.filter(r => r.date >= cutoffStr && r.date <= date)
+          .reduce((s, r) => s + r.distKm, 0) * 10
+    ) / 10;
+  }
+
+  // ── 4. Build Fitness Trend rows (one per run) ──────────────────────────────
+  const rows = runs.map(r => {
+    const ae     = r.avgHr ? calcAE(r.distM, r.durationSec, r.avgHr) : null;
+    const hrv7d  = rolling7d(hrvByDate, r.date);
+    const rec7d  = rolling7d(recoveryByDate, r.date);
+    const vol28d = rolling28dVolume(r.date);
+
+    // VDOT only for quality efforts: pace ≤ 4:30/km, dist ≥ 5km
+    const paceSecPerKm = r.durationSec / r.distKm;
+    const vdot = (paceSecPerKm <= 270 && r.distKm >= 5) ? calcVdot(r.distM, r.durationSec) : null;
+
+    return [
+      r.date,
+      vdot  != null ? vdot  : '',
+      ae    != null ? ae    : '',
+      hrv7d != null ? hrv7d : '',
+      vol28d,
+      rec7d != null ? rec7d : '',
+    ];
+  });
+
+  // ── 5. Clear and rewrite Fitness Trend ────────────────────────────────────
+  process.stderr.write('Rebuilding Fitness Trend tab...\n');
+  await clearRange(token, `${TAB_FITNESS}!A1:Z10000`);
+  await appendRows(token, TAB_FITNESS, [HEADERS[TAB_FITNESS]]);
+
+  const BATCH = 200;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    await appendRows(token, TAB_FITNESS, rows.slice(i, i + BATCH));
+    process.stderr.write(`  Written ${Math.min(i + BATCH, rows.length)}/${rows.length}\n`);
+  }
+
+  const vdotCount = rows.filter(r => r[1] !== '').length;
+  return `✓ Fitness Trend rebuilt from sheets: ${rows.length} rows (${vdotCount} with VDOT)`;
+}
+
+async function writeRow(token, tabName, rowIndex, values) {
+  const lastCol = String.fromCharCode(64 + values.length);
+  const range   = encodeURIComponent(`${tabName}!A${rowIndex}:${lastCol}${rowIndex}`);
+  const url     = `${SHEETS_API}/${sheetId()}/values/${range}?valueInputOption=USER_ENTERED`;
+  const res     = await httpRequest('PUT', url, token, { values: [values] });
+  if (res.status !== 200) die(`Failed to write row (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+}
+
+async function cmdRewriteWorkoutLog() {
+  process.stderr.write('Rewriting Workout Log...\n');
+  const sheetsToken = await getAccessToken();
+  const stravaToken = await getStravaToken();
+
+  // Get numeric sheet ID for conditional formatting
+  const meta         = await getSpreadsheetMeta(sheetsToken);
+  const workoutSheet = (meta.sheets || []).find(s => s.properties.title === TAB_WORKOUTS);
+  if (!workoutSheet) die('Workout Log tab not found. Run: sheets init');
+  const wsId = workoutSheet.properties.sheetId;
+
+  // 1. Clear data rows + rewrite header
+  await clearRange(sheetsToken, `${TAB_WORKOUTS}!A1:Z10000`);  // clear full sheet incl. header + any stale cols
+  await writeRow(sheetsToken, TAB_WORKOUTS, 1, HEADERS[TAB_WORKOUTS]);
+
+  // 2. Fetch all Strava activities from 2024-01-01
+  const afterTs = Math.floor(new Date('2024-01-01').getTime() / 1000);
+  const allActs = [];
+  let page = 1;
+  while (true) {
+    const q = new URL('https://www.strava.com/api/v3/athlete/activities');
+    q.searchParams.set('after',    String(afterTs));
+    q.searchParams.set('before',   String(Math.floor(Date.now() / 1000)));
+    q.searchParams.set('per_page', '100');
+    q.searchParams.set('page',     String(page));
+    const res = await httpRequest('GET', q.toString(), stravaToken);
+    if (res.status !== 200) throw new Error(`Strava ${res.status}: ${JSON.stringify(res.body)}`);
+    if (!Array.isArray(res.body) || res.body.length === 0) break;
+    allActs.push(...res.body);
+    process.stderr.write(`  Strava page ${page}: ${res.body.length} activities\n`);
+    if (res.body.length < 100) break;
+    page++;
+  }
+
+  // 3. Sort by date descending — newest first
+  allActs.sort((a, b) => b.start_date_local.localeCompare(a.start_date_local));
+
+  const rows = allActs.map(a => {
+    const date    = a.start_date_local.slice(0, 10);
+    const distKm  = Math.round(a.distance / 100) / 10;
+    const isRun   = ['Run', 'VirtualRun', 'TrailRun'].includes(a.type);
+    const isRide  = ['Ride', 'VirtualRide', 'EBikeRide'].includes(a.type);
+    let paceOrPower = '';
+    if (isRun && a.distance > 0 && a.moving_time > 0) {
+      paceOrPower = fmtPace(a.distance, a.moving_time);
+    } else if (isRide && a.average_watts > 0) {
+      paceOrPower = `${Math.round(a.average_watts)} W`;
+    } else if (a.average_speed > 0) {
+      paceOrPower = `${(a.average_speed * 3.6).toFixed(1)} km/h`;
+    }
+    return [
+      date,
+      dayName(date),
+      a.type,
+      distKm > 0 ? distKm : '',
+      fmtTime(a.moving_time),
+      a.average_heartrate ? Math.round(a.average_heartrate) : '',
+      paceOrPower,
+      '',         // Status — filled by evening task going forward
+      a.name || '',
+      '',         // Coach Note — filled by evening task going forward
+    ];
+  });
+
+  process.stderr.write(`  Total activities: ${rows.length}\n`);
+
+  // 4. Append in batches of 100
+  const BATCH = 100;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    await appendRows(sheetsToken, TAB_WORKOUTS, rows.slice(i, i + BATCH));
+    process.stderr.write(`  Appended ${Math.min(i + BATCH, rows.length)}/${rows.length}\n`);
+  }
+
+  // 5. Format columns + conditional formatting by Status (col H = index 7)
+  const deleteRules = (workoutSheet.conditionalFormats || []).map((_, i) => ({
+    deleteConditionalFormatRule: { sheetId: wsId, index: 0 },
+  }));
+
+  const formatDateCol = {
+    repeatCell: {
+      range:  { sheetId: wsId, startRowIndex: 1, endRowIndex: 10000, startColumnIndex: 0, endColumnIndex: 1 },
+      cell:   { userEnteredFormat: { numberFormat: { type: 'DATE', pattern: 'yyyy-mm-dd' } } },
+      fields: 'userEnteredFormat.numberFormat',
+    },
+  };
+
+  // Column E (index 4) = Duration — format as [h]:mm:ss elapsed time
+  const formatDurCol = {
+    repeatCell: {
+      range:  { sheetId: wsId, startRowIndex: 1, endRowIndex: 10000, startColumnIndex: 4, endColumnIndex: 5 },
+      cell:   { userEnteredFormat: { numberFormat: { type: 'TIME', pattern: '[h]:mm:ss' } } },
+      fields: 'userEnteredFormat.numberFormat',
+    },
+  };
+
+  // Conditional formatting: colour entire row based on Status (col H = index 7)
+  const dataRange = {
+    sheetId: wsId, startRowIndex: 1, endRowIndex: 10000,
+    startColumnIndex: 0, endColumnIndex: 10,
+  };
+  function cfRule(formula, color) {
+    return { addConditionalFormatRule: { index: 0, rule: {
+      ranges: [dataRange],
+      booleanRule: {
+        condition: { type: 'CUSTOM_FORMULA', values: [{ userEnteredValue: formula }] },
+        format:    { backgroundColor: color },
+      },
+    }}};
+  }
+  const green  = { red: 0.576, green: 0.769, blue: 0.490 };
+  const yellow = { red: 1.0,   green: 0.898, blue: 0.600 };
+  const red    = { red: 0.878, green: 0.400, blue: 0.400 };
+
+  const allRequests = [
+    formatDateCol,
+    formatDurCol,
+    ...deleteRules,
+    cfRule('=$H2="hit"',     green),
+    cfRule('=$H2="strong"',  green),
+    cfRule('=$H2="weak"',    yellow),
+    cfRule('=$H2="partial"', yellow),
+    cfRule('=$H2="missed"',  red),
+  ];
+
+  const cfUrl = `${SHEETS_API}/${sheetId()}:batchUpdate`;
+  const cfRes = await httpRequest('POST', cfUrl, sheetsToken, { requests: allRequests });
+  if (cfRes.status !== 200) process.stderr.write(`  Warning: format setup failed: ${JSON.stringify(cfRes.body)}\n`);
+  else process.stderr.write('  Formatting + conditional coloring applied\n');
+
+  return `✓ Workout Log rewritten: ${rows.length} activities added`;
+}
+
+async function cmdAddCharts() {
+  const token = await getAccessToken();
+  const meta  = await getSpreadsheetMeta(token);
+
+  const fitnessSheet = (meta.sheets || []).find(s => s.properties.title === TAB_FITNESS);
+  if (!fitnessSheet) die('Fitness Trend tab not found. Run: sheets init first.');
+  const fitSid = fitnessSheet.properties.sheetId;
+
+  // ── 1. Clear the tab + ensure enough columns (need at least 28 for AA-AB) ───
+  await clearRange(token, `${TAB_FITNESS}!A1:Z10000`);
+  const expandGrid = await httpRequest('POST', `${SHEETS_API}/${sheetId()}:batchUpdate`, token, {
+    requests: [{ updateSheetProperties: {
+      properties: { sheetId: fitSid, gridProperties: { columnCount: 30 } },
+      fields: 'gridProperties.columnCount',
+    }}],
+  });
+  if (expandGrid.status !== 200) process.stderr.write(`  Warning: could not expand grid: ${JSON.stringify(expandGrid.body)}\n`);
+
+  // ── 2. Write formula cells into hidden cols S-X (indices 18-23) ────────────
+  //
+  // Layout (all data hidden — charts float on cols A-N):
+  //   Cols S-U = workout data  (Date | Distance | Avg HR)
+  //   Cols V-X = recovery data (Date | HRV      | Recovery %)
+  //
+  //   Rows  1-10 = weekly  data  (FILTER current Mon–Sun, auto-resets)
+  //   Rows 11-24 = monthly data  (AVERAGEIFS Jan–Dec of current year)
+
+  // Hungarian locale (hu_HU): function args use ";" and array column separator is "\"
+  const SEP = ';';   // function argument separator
+  const ARR = '\\';  // array literal column separator (backslash)
+
+  const W_MON  = `TODAY()-WEEKDAY(TODAY()${SEP}2)+1`;
+  const W_SUN  = `TODAY()-WEEKDAY(TODAY()${SEP}2)+7`;
+  const RUN_RE = `"*Run*"`;
+
+  //
+  // Layout (all hidden):
+  //   S(18)=Date  T(19)=Dist  U(20)=HR  V(21)=AE  W(22)=VDOT  — workout
+  //   X(23)=Date  Y(24)=HRV   Z(25)=Rec%              — recovery
+  //   AA(26)=ARRAYFORMULA AE per Workout Log row
+  //   AB(27)=ARRAYFORMULA VDOT per Workout Log row
+  //   Rows  1-10 = weekly  (Mon–Sun)
+  //   Rows 11-24 = monthly (Jan–Dec)
+
+  function dt(m, y = 'YEAR(TODAY())') { return `DATE(${y}${SEP}${m}${SEP}1)`; }
+
+  // ARRAYFORMULA helpers (written to AA2, AB2 — referenced by weekly FILTER and monthly AVERAGEIFS)
+  const aeFormula =
+    `=ARRAYFORMULA(IF(REGEXMATCH('Workout Log'!C$2:C${SEP}"Run")*('Workout Log'!F$2:F>0)*('Workout Log'!D$2:D>0)*('Workout Log'!E$2:E>0)${SEP}` +
+    `ROUND(('Workout Log'!D$2:D*1000)/('Workout Log'!E$2:E*1440)/'Workout Log'!F$2:F*100${SEP}2)${SEP}""))`;
+
+  // hu_HU locale: decimal separator is comma, not period. All decimal literals use commas.
+  // Also use POWER() not ^ — ^ fails on array ranges in ARRAYFORMULA in hu_HU locale.
+  const DEC = (n) => String(n).replace('.', ',');
+  const vdotFormula =
+    `=ARRAYFORMULA(IF(REGEXMATCH('Workout Log'!C$2:C${SEP}"Run")*('Workout Log'!D$2:D>=5)*('Workout Log'!E$2:E*86400/'Workout Log'!D$2:D<=270)*('Workout Log'!F$2:F>0)${SEP}` +
+    `ROUND((${DEC(-4.6)}+${DEC(0.182258)}*('Workout Log'!D$2:D*1000/('Workout Log'!E$2:E*1440))+${DEC(0.000104)}*POWER('Workout Log'!D$2:D*1000/('Workout Log'!E$2:E*1440)${SEP}2))/` +
+    `(${DEC(0.8)}+${DEC(0.1894393)}*EXP(${DEC(-0.012778)}*('Workout Log'!E$2:E*1440))+${DEC(0.2989558)}*EXP(${DEC(-0.1932605)}*('Workout Log'!E$2:E*1440)))${SEP}1)${SEP}""))`;
+
+  // Weekly FILTER: 5-col workout (Date,Dist,HR,AE,VDOT), 3-col recovery (Date,HRV,Rec%)
+  // AE and VDOT computed inline — avoids cross-sheet array dimension mismatch when using AA$2:AA
+  const wCond = `('Workout Log'!A$2:A>=${W_MON})*('Workout Log'!A$2:A<=${W_SUN})*REGEXMATCH('Workout Log'!C$2:C${SEP}"Run")`;
+  const inlineAE =
+    `IFERROR(ROUND(('Workout Log'!D$2:D*1000)/('Workout Log'!E$2:E*1440)/'Workout Log'!F$2:F*100${SEP}2)${SEP}"")`;
+  const inlineVDOT =
+    `IFERROR(IF(('Workout Log'!D$2:D>=5)*('Workout Log'!E$2:E*86400/'Workout Log'!D$2:D<=270)*('Workout Log'!F$2:F>0)${SEP}` +
+    `ROUND((${DEC(-4.6)}+${DEC(0.182258)}*('Workout Log'!D$2:D*1000/('Workout Log'!E$2:E*1440))+${DEC(0.000104)}*POWER('Workout Log'!D$2:D*1000/('Workout Log'!E$2:E*1440)${SEP}2))/(${DEC(0.8)}+${DEC(0.1894393)}*EXP(${DEC(-0.012778)}*('Workout Log'!E$2:E*1440))+${DEC(0.2989558)}*EXP(${DEC(-0.1932605)}*('Workout Log'!E$2:E*1440)))${SEP}1)${SEP}"")${SEP}"")`;
+  const weeklyWorkoutFormula =
+    `=IFERROR(SORT(FILTER({'Workout Log'!A$2:A${ARR}'Workout Log'!D$2:D${ARR}'Workout Log'!F$2:F${ARR}${inlineAE}${ARR}${inlineVDOT}}${SEP}${wCond})${SEP}1${SEP}TRUE)${SEP}"")`;
+
+  const rCond = `('Recovery Trends'!A$2:A>=${W_MON})*('Recovery Trends'!A$2:A<=${W_SUN})`;
+  const weeklyRecoveryFormula =
+    `=IFERROR(SORT(FILTER({'Recovery Trends'!A$2:A${ARR}'Recovery Trends'!C$2:C${ARR}'Recovery Trends'!B$2:B}${SEP}${rCond})${SEP}1${SEP}TRUE)${SEP}"")`;
+
+  // Monthly rows — SUMPRODUCT computes AE/VDOT inline from Workout Log only (no cross-sheet AVERAGEIFS)
+  const WL = (col, r = '1000') => `'Workout Log'!${col}$2:${col}${r}`;
+  const monthlyWorkoutRows = Array.from({ length: 12 }, (_, i) => {
+    const m  = i + 1;
+    const nm = m === 12 ? 1 : m + 1;
+    const ny = m === 12 ? 'YEAR(TODAY())+1' : 'YEAR(TODAY())';
+    const s  = dt(m); const e = dt(nm, ny);
+    const crit = `'Workout Log'!A:A${SEP}">="&${s}${SEP}'Workout Log'!A:A${SEP}"<"&${e}`;
+    // Shared condition for all runs in this month (bounded to 1000 rows)
+    // IFERROR protects divisions that would error on empty rows (no short-circuit in SUMPRODUCT)
+    const baseCond = `(${WL('A')}>=${s})*(${WL('A')}<${e})*REGEXMATCH(${WL('C')}${SEP}"Run")*(${WL('F')}>0)*(${WL('D')}>0)*(${WL('E')}>0)`;
+    // AE = (dist_km*1000) / (dur_days*1440) / avg_hr * 100 — wrapped in IFERROR for D=0/E=0 rows
+    const aeCalc = `IFERROR(${WL('D')}*1000/(${WL('E')}*1440)/${WL('F')}*100${SEP}0)`;
+    // VDOT condition: pace ≤ 4:30/km (dur_days*86400/dist_km ≤ 270) and dist ≥ 5km
+    // IFERROR on pace check to avoid #DIV/0! on D=0 rows in SUMPRODUCT (not short-circuited)
+    const paceCond = `IFERROR(${WL('E')}*86400/${WL('D')}${SEP}999)<=270`;
+    const vdotCond = `${baseCond}*(${WL('D')}>=5)*(${paceCond})`;
+    const v  = `IFERROR(${WL('D')}*1000/(${WL('E')}*1440)${SEP}0)`;  // speed in m/min, 0 on error
+    const vdotCalc =
+      `IFERROR(ROUND((${DEC(-4.6)}+${DEC(0.182258)}*${v}+${DEC(0.000104)}*POWER(${v}${SEP}2))/(${DEC(0.8)}+${DEC(0.1894393)}*EXP(${DEC(-0.012778)}*${WL('E')}*1440)+${DEC(0.2989558)}*EXP(${DEC(-0.1932605)}*${WL('E')}*1440))${SEP}1)${SEP}0)`;
+    return [
+      `=${s}`,
+      `=IF(SUMIFS('Workout Log'!D:D${SEP}'Workout Log'!C:C${SEP}${RUN_RE}${SEP}${crit})>0${SEP}SUMIFS('Workout Log'!D:D${SEP}'Workout Log'!C:C${SEP}${RUN_RE}${SEP}${crit})${SEP}"")`,
+      `=IFERROR(AVERAGEIFS('Workout Log'!F:F${SEP}'Workout Log'!C:C${SEP}${RUN_RE}${SEP}'Workout Log'!F:F${SEP}">"&0${SEP}${crit})${SEP}"")`,
+      `=IFERROR(ROUND(SUMPRODUCT(IF(${baseCond}${SEP}${aeCalc}${SEP}0))/SUMPRODUCT(${baseCond}*1)${SEP}2)${SEP}"")`,
+      `=IFERROR(ROUND(SUMPRODUCT(IF(${vdotCond}${SEP}${vdotCalc}${SEP}0))/SUMPRODUCT(${vdotCond}*1)${SEP}1)${SEP}"")`,
+    ];
+  });
+
+  const monthlyRecoveryRows = Array.from({ length: 12 }, (_, i) => {
+    const m  = i + 1;
+    const nm = m === 12 ? 1 : m + 1;
+    const ny = m === 12 ? 'YEAR(TODAY())+1' : 'YEAR(TODAY())';
+    const s  = dt(m); const e = dt(nm, ny);
+    return [
+      `=${s}`,
+      `=IFERROR(AVERAGEIFS('Recovery Trends'!C:C${SEP}'Recovery Trends'!A:A${SEP}">="&${s}${SEP}'Recovery Trends'!A:A${SEP}"<"&${e})${SEP}"")`,
+      `=IFERROR(AVERAGEIFS('Recovery Trends'!B:B${SEP}'Recovery Trends'!A:A${SEP}">="&${s}${SEP}'Recovery Trends'!A:A${SEP}"<"&${e})${SEP}"")`,
+    ];
+  });
+
+  const tab = TAB_FITNESS;
+  await batchWriteValues(token, [
+    // ARRAYFORMULA computed cols AA, AB (AE and VDOT per Workout Log row)
+    { range: `${tab}!AA2`, values: [[aeFormula]] },
+    { range: `${tab}!AB2`, values: [[vdotFormula]] },
+    // Weekly headers (row 1): workout S-W, recovery X-Z
+    { range: `${tab}!S1:W1`, values: [['Date','Dist (km)','Avg HR (bpm)','AE Index','VDOT']] },
+    { range: `${tab}!X1:Z1`, values: [['Date','HRV (ms)','Recovery %']] },
+    // Weekly FILTER formulas row 2 (spill automatically)
+    { range: `${tab}!S2`, values: [[weeklyWorkoutFormula]] },
+    { range: `${tab}!X2`, values: [[weeklyRecoveryFormula]] },
+    // Monthly headers row 11
+    { range: `${tab}!S11:W11`, values: [['Month','Total Dist (km)','Avg HR (bpm)','Avg AE Index','Avg VDOT']] },
+    { range: `${tab}!X11:Z11`, values: [['Month','Avg HRV (ms)','Avg Recovery %']] },
+    // Monthly workout rows 12-23 (5 cols)
+    { range: `${tab}!S12:W23`, values: monthlyWorkoutRows },
+    // Monthly recovery rows 12-23 (3 cols)
+    { range: `${tab}!X12:Z23`, values: monthlyRecoveryRows },
+  ]);
+  process.stderr.write('  Formula cells written\n');
+
+  // ── 3. Build batchUpdate requests ──────────────────────────────────────────
+  const deleteCharts = (fitnessSheet.charts || []).map(c => ({
+    deleteEmbeddedObject: { objectId: c.chartId },
+  }));
+
+  // First reset number format across ALL hidden cols (S=18 through AB=27) to avoid stale date formats
+  const clearNumFormat = {
+    repeatCell: {
+      range:  { sheetId: fitSid, startRowIndex: 0, endRowIndex: 24, startColumnIndex: 18, endColumnIndex: 28 },
+      cell:   { userEnteredFormat: { numberFormat: { type: 'NUMBER', pattern: '' } } },
+      fields: 'userEnteredFormat.numberFormat',
+    },
+  };
+
+  // Then re-apply DATE format only to date cols S(18) and X(23)
+  const formatDateCols = [18, 23].map(startCol => ({
+    repeatCell: {
+      range:  { sheetId: fitSid, startRowIndex: 1, endRowIndex: 24, startColumnIndex: startCol, endColumnIndex: startCol + 1 },
+      cell:   { userEnteredFormat: { numberFormat: { type: 'DATE', pattern: 'mmm d' } } },
+      fields: 'userEnteredFormat.numberFormat',
+    },
+  }));
+
+  // Hide cols S-AB (indices 18-27)
+  const hideCols = {
+    updateDimensionProperties: {
+      range: { sheetId: fitSid, dimension: 'COLUMNS', startIndex: 18, endIndex: 28 },
+      properties: { hiddenByUser: true },
+      fields: 'hiddenByUser',
+    },
+  };
+
+  // Chart helper
+  function gr(startRow, endRow, col) {
+    return { sheetId: fitSid, startRowIndex: startRow, endRowIndex: endRow, startColumnIndex: col, endColumnIndex: col + 1 };
+  }
+
+  // S=18 T=19 U=20 V=21 W=22 X=23 Y=24 Z=25
+  // Weekly rows 0-9, Monthly rows 10-23
+  const W = { start: 0, end: 10 };
+  const M = { start: 10, end: 24 };
+
+  function makeChart(title, domainCol, series, axisLabels, anchorRow, anchorCol, rowRange, chartType = 'LINE') {
+    return {
+      addChart: {
+        chart: {
+          spec: {
+            title,
+            hiddenDimensionStrategy: 'SHOW_ALL',
+            basicChart: {
+              chartType,
+              legendPosition: 'BOTTOM_LEGEND',
+              axis: [
+                { position: 'BOTTOM_AXIS', title: '' },
+                { position: 'LEFT_AXIS',   title: axisLabels[0] },
+                ...(axisLabels[1] ? [{ position: 'RIGHT_AXIS', title: axisLabels[1] }] : []),
+              ],
+              domains: [{ domain: { sourceRange: { sources: [gr(rowRange.start, rowRange.end, domainCol)] } } }],
+              series: series.map(({ col, axis, type }) => ({
+                series:     { sourceRange: { sources: [gr(rowRange.start, rowRange.end, col)] } },
+                targetAxis: axis || 'LEFT_AXIS',
+                ...(type ? { type } : {}),
+              })),
+              ...(chartType !== 'COLUMN' ? { interpolateNulls: true } : {}),
+            },
+          },
+          position: {
+            overlayPosition: {
+              anchorCell:    { sheetId: fitSid, rowIndex: anchorRow, columnIndex: anchorCol },
+              widthPixels:   620,
+              heightPixels:  320,
+            },
+          },
+        },
+      },
+    };
+  }
+
+  // 10 charts: 5 metrics × 2 periods. Left col=0 weekly, right col=9 monthly.
+  // S=18 T=19 U=20 V=21 W=22 X=23 Y=24 Z=25
+  const addCharts = [
+    // Distance (row 0)
+    makeChart('Distance / Week',        18, [{ col: 19 }],  ['km'],            0,  0, W, 'COLUMN'),
+    makeChart('Distance / Month',       18, [{ col: 19 }],  ['km'],            0,  9, M, 'COLUMN'),
+    // Avg HR (row 22)
+    makeChart('Avg HR / Week',          18, [{ col: 20 }],  ['bpm'],          22,  0, W, 'LINE'),
+    makeChart('Avg HR / Month',         18, [{ col: 20 }],  ['bpm'],          22,  9, M, 'LINE'),
+    // AE Index (row 44)
+    makeChart('AE Index / Week',        18, [{ col: 21 }],  ['AE Index'],     44,  0, W, 'LINE'),
+    makeChart('AE Index / Month',       18, [{ col: 21 }],  ['AE Index'],     44,  9, M, 'LINE'),
+    // VDOT (row 66)
+    makeChart('VDOT / Week',            18, [{ col: 22 }],  ['VDOT'],         66,  0, W, 'LINE'),
+    makeChart('VDOT / Month',           18, [{ col: 22 }],  ['VDOT'],         66,  9, M, 'LINE'),
+    // HRV & Recovery (row 88)
+    makeChart('HRV & Recovery / Week',  23,
+      [{ col: 24, axis: 'LEFT_AXIS', type: 'LINE' }, { col: 25, axis: 'RIGHT_AXIS', type: 'COLUMN' }],
+      ['HRV (ms)', 'Recovery %'],       88,  0, W, 'COMBO'),
+    makeChart('HRV & Recovery / Month', 23,
+      [{ col: 24, axis: 'LEFT_AXIS', type: 'LINE' }, { col: 25, axis: 'RIGHT_AXIS', type: 'COLUMN' }],
+      ['HRV (ms)', 'Recovery %'],       88,  9, M, 'COMBO'),
+  ];
+
+  const requests = [clearNumFormat, ...formatDateCols, hideCols, ...deleteCharts, ...addCharts];
+  const batchUrl = `${SHEETS_API}/${sheetId()}:batchUpdate`;
+  const res = await httpRequest('POST', batchUrl, token, { requests });
+  if (res.status !== 200) die(`Failed to add charts (HTTP ${res.status}): ${JSON.stringify(res.body)}`);
+
+  return `✓ Fitness Trend rebuilt — 10 charts (weekly + monthly) for Distance, HR, AE Index, VDOT, HRV & Recovery`;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function parseJsonArg(str) {
+  if (!str) die('JSON argument required.');
+  try { return JSON.parse(str); }
+  catch { die(`Invalid JSON: ${str}`); }
+}
+
+function die(msg) { console.error('Error:', msg); process.exit(1); }
+
+function usage() {
+  console.log(`Usage:
+  sheets init
+  sheets log-workout '<json>'
+  sheets log-plan '<json>'
+  sheets log-recovery '<json>'
+  sheets log-fitness '<json>'
+  sheets get-plan [--week YYYY-MM-DD]
+  sheets get-workouts [--days N]
+  sheets get-fitness [--days N]
+  sheets backfill-fitness [--reset]
+  sheets rewrite-workout-log
+  sheets add-charts`);
+  process.exit(1);
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+async function main() {
+  const args = process.argv.slice(2);
+  const cmd  = args[0];
+  if (!cmd) usage();
+
+  try {
+    let out;
+    switch (cmd) {
+      case 'init':         out = await cmdInit(); break;
+      case 'log-workout':   out = await cmdLogWorkout(args[1]); break;
+      case 'coach-note':    out = await cmdCoachNote(args[1]); break;
+      case 'log-plan':     out = await cmdLogPlan(args[1]); break;
+      case 'log-recovery': out = await cmdLogRecovery(args[1]); break;
+      case 'get-plan': {
+        const wIdx = args.indexOf('--week');
+        out = await cmdGetPlan(wIdx >= 0 ? args[wIdx + 1] : null);
+        break;
+      }
+      case 'get-workouts': {
+        const dIdx = args.indexOf('--days');
+        out = await cmdGetWorkouts(dIdx >= 0 ? parseInt(args[dIdx + 1]) || 7 : 7);
+        break;
+      }
+      case 'log-fitness':  out = await cmdLogFitness(args[1]); break;
+      case 'get-fitness': {
+        const dIdx = args.indexOf('--days');
+        out = await cmdGetFitness(dIdx >= 0 ? parseInt(args[dIdx + 1]) || 90 : 90);
+        break;
+      }
+      case 'backfill-fitness':    out = await cmdBackfillFitness(args.includes('--reset')); break;
+      case 'rewrite-workout-log': out = await cmdRewriteWorkoutLog(); break;
+      case 'add-charts':          out = await cmdAddCharts(); break;
+      default: usage();
+    }
+    console.log(out);
+  } catch (err) {
+    die(err.message);
+  }
+}
+
+main();

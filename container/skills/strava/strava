@@ -8,6 +8,9 @@
  *   strava range 2025-01-01 2025-01-31    # activities across a date range
  *   strava recent [--days N]              # recent activities (default: 7 days)
  *   strava athlete                        # athlete profile and stats
+ *   strava detail <ID|date>               # laps + per-km splits for an activity
+ *                                         #   ID = Strava activity ID
+ *                                         #   date = YYYY-MM-DD (uses first activity of the day)
  *
  * Credentials read from env (or auto-loaded from .env):
  *   STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_REFRESH_TOKEN
@@ -52,10 +55,17 @@ const path  = require('path');
 const TOKEN_URL = 'https://www.strava.com/oauth/token';
 const API       = 'https://www.strava.com/api/v3';
 
-// Token cache location: writable group dir in container, store/ on host
-const TOKEN_CACHE = fs.existsSync('/workspace/group')
-  ? '/workspace/group/.strava-tokens.json'
-  : path.join(__dirname, '..', '..', '..', 'store', '.strava-tokens.json');
+// Token cache location: shared store/ — same file on host and container.
+// Strava rotates refresh tokens, so host and container MUST share one cache
+// or they invalidate each other's refresh_token.
+function resolveTokenCache() {
+  const containerStore = '/workspace/project/store';
+  try { fs.accessSync(containerStore, fs.constants.W_OK); return `${containerStore}/.strava-tokens.json`; }
+  catch {}
+  if (fs.existsSync('/workspace/group')) return '/workspace/group/.strava-tokens.json';
+  return path.join(__dirname, '..', '..', '..', 'store', '.strava-tokens.json');
+}
+const TOKEN_CACHE = resolveTokenCache();
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
@@ -206,6 +216,25 @@ async function fetchAthlete(token) {
 
 async function fetchAthleteStats(athleteId, token) {
   const res = await httpGet(`${API}/athletes/${athleteId}/stats`, token);
+  if (res.status !== 200) throw new Error(`API ${res.status}: ${JSON.stringify(res.body)}`);
+  return res.body;
+}
+
+async function fetchActivity(activityId, token) {
+  const res = await httpGet(`${API}/activities/${activityId}`, token);
+  if (res.status !== 200) throw new Error(`API ${res.status}: ${JSON.stringify(res.body)}`);
+  return res.body;
+}
+
+async function fetchLaps(activityId, token) {
+  const res = await httpGet(`${API}/activities/${activityId}/laps`, token);
+  if (res.status !== 200) throw new Error(`API ${res.status}: ${JSON.stringify(res.body)}`);
+  return res.body;
+}
+
+async function fetchStreams(activityId, keys, token) {
+  const url = `${API}/activities/${activityId}/streams?keys=${keys.join(',')}&key_by_type=true`;
+  const res = await httpGet(url, token);
   if (res.status !== 200) throw new Error(`API ${res.status}: ${JSON.stringify(res.body)}`);
   return res.body;
 }
@@ -428,6 +457,119 @@ async function cmdAthlete() {
   return lines.join('\n');
 }
 
+async function cmdDetail(idOrDate) {
+  const token = await getAccessToken();
+  let activityId;
+
+  // If it looks like a date, find the first activity of that day
+  if (/^\d{4}-\d{2}-\d{2}$/.test(idOrDate)) {
+    const { after, before } = dateRange(idOrDate);
+    const activities = await fetchActivities(after, before, token);
+    if (!activities.length) die(`No activities found on ${idOrDate}`);
+    // Pick the most recent one (first in the list — Strava returns newest first)
+    activityId = activities[0].id;
+  } else {
+    activityId = idOrDate;
+  }
+
+  const [activity, laps, streams] = await Promise.all([
+    fetchActivity(activityId, token),
+    fetchLaps(activityId, token),
+    fetchStreams(activityId, ['distance', 'heartrate', 'time', 'velocity_smooth', 'cadence', 'watts', 'altitude'], token).catch(() => null),
+  ]);
+
+  const sport = activity.sport_type || activity.type;
+  const lines = [`── ${activity.name}  (${sport}) ──────────────────────`];
+  lines.push(`  Date:     ${fmtDate(activity.start_date_local)}`);
+  lines.push(`  Distance: ${fmtDist(activity.distance)}  ·  Time: ${fmtDuration(activity.moving_time)}  ·  Elapsed: ${fmtDuration(activity.elapsed_time)}`);
+  lines.push(`  Pace:     ${fmtPace(activity.average_speed, sport)}  ·  Max: ${fmtPace(activity.max_speed, sport)}`);
+  if (activity.average_heartrate != null) {
+    lines.push(`  HR:       avg ${activity.average_heartrate.toFixed(0)} bpm  ·  max ${activity.max_heartrate != null ? activity.max_heartrate.toFixed(0) : 'N/A'} bpm`);
+  }
+  if (activity.average_watts != null) lines.push(`  Power:    ${activity.average_watts.toFixed(0)} W avg`);
+  if (activity.average_cadence != null) lines.push(`  Cadence:  ${(activity.average_cadence * 2).toFixed(0)} spm`);
+  if (activity.suffer_score != null) lines.push(`  Suffer:   ${activity.suffer_score}`);
+  if (activity.calories != null) lines.push(`  Calories: ${activity.calories}`);
+
+  // Laps
+  if (laps && laps.length > 1) {
+    lines.push('');
+    lines.push('── Laps ────────────────────────────────────');
+    const isRide = (sport || '').toLowerCase().includes('ride');
+    for (let i = 0; i < laps.length; i++) {
+      const l = laps[i];
+      const pace = fmtPace(l.average_speed, sport);
+      const hr = l.average_heartrate != null ? `HR ${l.average_heartrate.toFixed(0)}` : '';
+      const cad = l.average_cadence != null ? `Cad ${(l.average_cadence * (isRide ? 1 : 2)).toFixed(0)}` : '';
+      const pwr = l.average_watts != null ? `${l.average_watts.toFixed(0)}W` : '';
+      const parts = [pace, hr, cad, pwr].filter(Boolean).join('  ·  ');
+      lines.push(`  ${String(i + 1).padStart(2)}. ${fmtDist(l.distance).padEnd(10)} ${fmtDuration(l.moving_time).padEnd(9)} ${parts}`);
+    }
+  }
+
+  // Per-km splits from streams
+  if (streams && streams.distance && streams.time) {
+    const dist = streams.distance.data;
+    const time = streams.time.data;
+    const hr   = streams.heartrate ? streams.heartrate.data : null;
+    const cad  = streams.cadence   ? streams.cadence.data   : null;
+    const pwr  = streams.watts     ? streams.watts.data     : null;
+    const alt  = streams.altitude  ? streams.altitude.data  : null;
+
+    lines.push('');
+    lines.push('── Per-km Splits ───────────────────────────');
+
+    let kmIdx = 0;
+    let prevI = 0;
+    for (let i = 1; i < dist.length; i++) {
+      const kmBoundary = (kmIdx + 1) * 1000;
+      if (dist[i] >= kmBoundary || i === dist.length - 1) {
+        const isLast = i === dist.length - 1 && dist[i] < kmBoundary;
+        const segDist = dist[i] - dist[prevI];
+        const segTime = time[i] - time[prevI];
+        if (segDist < 50) { prevI = i; continue; } // skip tiny trailing segments
+
+        const paceSecPerKm = segTime / (segDist / 1000);
+        const pMin = Math.floor(paceSecPerKm / 60);
+        const pSec = Math.round(paceSecPerKm % 60);
+        const paceStr = `${pMin}:${String(pSec).padStart(2, '0')}/km`;
+
+        // Average HR/cadence/power/elevation for this km
+        const parts = [paceStr];
+        if (hr) {
+          let sum = 0, cnt = 0;
+          for (let j = prevI; j <= i; j++) { if (hr[j] != null) { sum += hr[j]; cnt++; } }
+          if (cnt > 0) parts.push(`HR ${Math.round(sum / cnt)}`);
+        }
+        if (cad) {
+          let sum = 0, cnt = 0;
+          for (let j = prevI; j <= i; j++) { if (cad[j] != null) { sum += cad[j]; cnt++; } }
+          if (cnt > 0) parts.push(`Cad ${Math.round(sum / cnt * 2)}`);
+        }
+        if (pwr) {
+          let sum = 0, cnt = 0;
+          for (let j = prevI; j <= i; j++) { if (pwr[j] != null) { sum += pwr[j]; cnt++; } }
+          if (cnt > 0) parts.push(`${Math.round(sum / cnt)}W`);
+        }
+        if (alt) {
+          const gain = alt[i] - alt[prevI];
+          if (Math.abs(gain) >= 1) parts.push(`${gain > 0 ? '+' : ''}${gain.toFixed(0)}m`);
+        }
+
+        const label = isLast
+          ? `${(segDist / 1000).toFixed(2)} km`
+          : `km ${kmIdx + 1}`;
+        lines.push(`  ${label.padEnd(8)} ${parts.join('  ·  ')}`);
+
+        kmIdx++;
+        prevI = i;
+      }
+    }
+  }
+
+  return lines.join('\n');
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 function die(msg) { console.error('Error:', msg); process.exit(1); }
@@ -438,7 +580,8 @@ function usage() {
   strava date YYYY-MM-DD
   strava range YYYY-MM-DD YYYY-MM-DD
   strava recent [--days N]
-  strava athlete`);
+  strava athlete
+  strava detail <ID|YYYY-MM-DD>`);
   process.exit(1);
 }
 
@@ -455,6 +598,7 @@ async function main() {
       case 'range':   if (!args[1] || !args[2]) die('range requires two dates'); out = await cmdRange(args[1], args[2]); break;
       case 'recent':  { const d = args.includes('--days') ? parseInt(args[args.indexOf('--days') + 1]) : 7; out = await cmdRecent(d); break; }
       case 'athlete': out = await cmdAthlete(); break;
+      case 'detail':  if (!args[1]) die('detail requires an activity ID or YYYY-MM-DD'); out = await cmdDetail(args[1]); break;
       default: usage();
     }
     console.log(out);

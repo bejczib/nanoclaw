@@ -57,10 +57,17 @@ const REDIRECT  = 'http://localhost:9877/callback';
 const V1        = 'https://api.prod.whoop.com/developer/v1';
 const V2        = 'https://api.prod.whoop.com/developer/v2';
 
-// Token cache location: writable group dir in container, store/ on host
-const TOKEN_CACHE = fs.existsSync('/workspace/group')
-  ? '/workspace/group/.whoop-tokens.json'
-  : path.join(__dirname, '..', '..', '..', 'store', '.whoop-tokens.json');
+// Token cache location: shared store/ — same file on host and container.
+// WHOOP rotates refresh tokens single-use, so host and container MUST share
+// one cache or they invalidate each other's refresh_token.
+function resolveTokenCache() {
+  const containerStore = '/workspace/project/store';
+  try { fs.accessSync(containerStore, fs.constants.W_OK); return `${containerStore}/.whoop-tokens.json`; }
+  catch {}
+  if (fs.existsSync('/workspace/group')) return '/workspace/group/.whoop-tokens.json';
+  return path.join(__dirname, '..', '..', '..', 'store', '.whoop-tokens.json');
+}
+const TOKEN_CACHE = resolveTokenCache();
 
 // ── HTTP helpers ──────────────────────────────────────────────────────────────
 
@@ -262,6 +269,16 @@ function fmtDate(iso) {
   return new Date(iso).toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
 }
 
+// WHOOP cycles are labelled by sleep-start date (when you fell asleep).
+// The recovery score is delivered the next morning — so the "recovery date"
+// visible to the user is always c.start + 1 calendar day.
+function wakeDate(cycleStart) {
+  if (!cycleStart) return 'N/A';
+  const d = new Date(cycleStart);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return fmtDate(d.toISOString());
+}
+
 function fmtDuration(ms) {
   if (!ms) return 'N/A';
   const h = Math.floor(ms / 3600000);
@@ -433,7 +450,7 @@ async function cmdRange(startStr, endStr) {
   const lines = [`── WHOOP ${startStr} → ${endStr} ───────────────────`];
 
   cycles.forEach(c => {
-    const label = fmtDate(c.start);
+    const label = wakeDate(c.start);
     lines.push('');
     lines.push(fmtCycleBlock(c, label));
   });
@@ -454,7 +471,7 @@ async function cmdRecovery(days) {
 
   const lines = [`── Recovery (last ${days} days) ─────────────────────`];
   cycles.forEach(c => {
-    lines.push(`\n  ${fmtDate(c.start)}`);
+    lines.push(`\n  ${wakeDate(c.start)}`);
     lines.push(fmtRecovery(c._recovery));
   });
   if (!cycles.length) lines.push('  No data found.');
@@ -468,7 +485,7 @@ async function cmdSleep(days) {
 
   const lines = [`── Sleep (last ${days} days) ─────────────────────────`];
   cycles.forEach(c => {
-    lines.push(`\n  ${fmtDate(c.start)}`);
+    lines.push(`\n  ${wakeDate(c.start)}`);
     lines.push(fmtSleep(c._sleep));
   });
   if (!cycles.length) lines.push('  No data found.');
@@ -486,7 +503,7 @@ async function cmdStrain(days) {
 
   const lines = [`── Strain (last ${days} days) ─────────────────────────`];
   cycles.forEach(c => {
-    lines.push(`\n  ${fmtDate(c.start)}`);
+    lines.push(`\n  ${wakeDate(c.start)}`);
     lines.push(fmtStrain(c));
   });
   if (!cycles.length) lines.push('  No data found.');
